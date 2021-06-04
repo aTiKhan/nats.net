@@ -46,6 +46,9 @@ namespace IntegrationTests
         public const int EncodingSuite = 11512; //1pc
         public const int SubscriptionsSuite = 11513; //1pc
         public const int TlsSuite = 11514; //3pc
+        public const int RxSuite = 11517; //1pc
+        public const int AsyncAwaitDeadlocksSuite = 11518; //1pc
+        public const int ConnectionIpV6Suite = 11519; //1pc
     }
 
     public abstract class SuiteContext
@@ -90,7 +93,7 @@ namespace IntegrationTests
         public const string CollectionKey = "9733f463316047fa9207e0a3aaa3c41a";
 
         private const int SeedPortNormalServers = TestSeedPorts.DefaultSuiteNormalServers;
-        
+
         public readonly TestServerInfo DefaultServer = new TestServerInfo(Defaults.Port);
 
         public readonly TestServerInfo Server1 = new TestServerInfo(SeedPortNormalServers);
@@ -139,6 +142,13 @@ namespace IntegrationTests
     public class ConnectionDrainSuiteContext : SuiteContext
     {
         private const int SeedPort = TestSeedPorts.ConnectionDrainSuite;
+
+        public readonly TestServerInfo Server1 = new TestServerInfo(SeedPort);
+    }
+
+    public class ConnectionIpV6SuiteContext : SuiteContext
+    {
+        private const int SeedPort = TestSeedPorts.ConnectionIpV6Suite;
 
         public readonly TestServerInfo Server1 = new TestServerInfo(SeedPort);
     }
@@ -192,6 +202,13 @@ namespace IntegrationTests
         public string[] GetTestServersShortListUrls() => TestServersShortList.Select(s => s.Url).ToArray();
     }
 
+    public class AsyncAwaitDeadlocksSuiteContext : SuiteContext
+    {
+        private const int SeedPort = TestSeedPorts.AsyncAwaitDeadlocksSuite;
+
+        public readonly TestServerInfo Server1 = new TestServerInfo(SeedPort);
+    }
+
     public class EncodingSuiteContext : SuiteContext
     {
         private const int SeedPort = TestSeedPorts.EncodingSuite;
@@ -213,6 +230,13 @@ namespace IntegrationTests
         public readonly TestServerInfo Server1 = new TestServerInfo(SeedPort);
     }
 
+    public class RxSuiteContext : SuiteContext
+    {
+        private const int SeedPort = TestSeedPorts.RxSuite;
+
+        public readonly TestServerInfo Server1 = new TestServerInfo(SeedPort);
+    }
+
     public class SubscriptionsSuiteContext : SuiteContext
     {
         private const int SeedPort = TestSeedPorts.SubscriptionsSuite;
@@ -227,5 +251,17 @@ namespace IntegrationTests
         public readonly TestServerInfo Server1 = new TestServerInfo(SeedPort);
         public readonly TestServerInfo Server2 = new TestServerInfo(SeedPort + 1);
         public readonly TestServerInfo Server3 = new TestServerInfo(SeedPort + 2);
+    }
+
+    public sealed class SkipPlatformsWithoutSignals : FactAttribute
+    {
+        public SkipPlatformsWithoutSignals()
+        {
+            if (NATSServer.SupportsSignals == false)
+            {
+                Skip = "Ignore environments that do not support signaling.";
+            }
+        }
+
     }
 }

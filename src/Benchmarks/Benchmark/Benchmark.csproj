@@ -2,7 +2,6 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFrameworks>netcoreapp2.2;net45</TargetFrameworks>
     <Title>NATS Benchmark</Title>
     <Description>NATS Benchmarking Application</Description>
     <IsPackable>false</IsPackable>

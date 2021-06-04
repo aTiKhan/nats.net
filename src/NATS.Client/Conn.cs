@@ -18,12 +18,14 @@ using System.IO;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Net;
 using System.Net.Sockets;
 using System.Net.Security;
 using System.Security.Cryptography.X509Certificates;
 using System.Security.Authentication;
 using System.Globalization;
 using System.Diagnostics;
+using NATS.Client.Internals;
 
 namespace NATS.Client
 {
@@ -98,9 +100,9 @@ namespace NATS.Client
 
         // NOTE: We aren't using Mutex here to support enterprises using
         // .NET 4.0.
-        readonly private object mu = new Object();
+        private readonly object mu = new Object();
 
-        private Random r = null;
+        private readonly Nuid _nuid = new Nuid();
 
         Options opts = new Options();
 
@@ -112,12 +114,10 @@ namespace NATS.Client
             get { return opts; }
         }
 
-        List<Thread> wg = new List<Thread>(2);
+        private readonly List<Thread> wg = new List<Thread>(2);
 
         private Uri             url     = null;
         private ServerPool srvPool = new ServerPool();
-
-        private Dictionary<string, Uri> urls = new Dictionary<string, Uri>();
 
         // we have a buffered reader for writing, and reading.
         // This is for both performance, and having to work around
@@ -134,10 +134,10 @@ namespace NATS.Client
         private ServerInfo     info = null;
         private Int64          ssid = 0;
 
-        private ConcurrentDictionary<Int64, Subscription> subs = 
-            new ConcurrentDictionary<Int64, Subscription>();
+        private Dictionary<Int64, Subscription> subs = 
+            new Dictionary<Int64, Subscription>();
         
-        private Queue<SingleUseChannel<bool>> pongs = new Queue<SingleUseChannel<bool>>();
+        private readonly ConcurrentQueue<SingleUseChannel<bool>> pongs = new ConcurrentQueue<SingleUseChannel<bool>>();
 
         internal MsgArg   msgArgs = new MsgArg();
 
@@ -146,77 +146,18 @@ namespace NATS.Client
         internal Exception lastEx;
 
         Timer               ptmr = null;
-
         int                 pout = 0;
 
+        internal static Random random = new Random();
+
         private AsyncSubscription globalRequestSubscription;
-        private TaskCompletionSource<object> globalRequestSubReady;
-        private string globalRequestInbox;
+        private readonly string globalRequestInbox;
 
         // used to map replies to requests from client (should lock)
         private long nextRequestId = 0;
 
-        private Dictionary<string, InFlightRequest> waitingRequests = 
-            new Dictionary<string, InFlightRequest>(StringComparer.OrdinalIgnoreCase);
-
-        // Handles in-flight requests when using the new-style request/reply behavior
-        private sealed class InFlightRequest : IDisposable
-        {
-            public InFlightRequest(CancellationToken token, int timeout)
-            {
-                this.Waiter = new TaskCompletionSource<Msg>();
-                if (token != default(CancellationToken))
-                {
-                    token.Register(() => this.Waiter.TrySetCanceled());
-
-                    if (timeout > 0)
-                    {
-                        var timeoutToken = new CancellationTokenSource();
-
-                        var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
-                            timeoutToken.Token, token);
-                        this.Token = linkedTokenSource.Token;
-
-                        this.timeoutTokenRegistration = timeoutToken.Token.Register(
-                            () => this.Waiter.TrySetException(new NATSTimeoutException()));
-                        timeoutToken.CancelAfter(timeout);
-                    }
-                    else
-                    {
-                        this.Token = token;
-                    }
-                }
-                else
-                {
-                    if (timeout > 0)
-                    {
-                        var timeoutToken = new CancellationTokenSource();
-                        this.Token = timeoutToken.Token;
-                        this.timeoutTokenRegistration = timeoutToken.Token.Register(
-                            () => this.Waiter.TrySetException(new NATSTimeoutException()));
-                        timeoutToken.CancelAfter(timeout);
-                    }
-                }
-            }
-
-            public string Id { get; set; }
-            public CancellationToken Token { get; private set; }
-            public TaskCompletionSource<Msg> Waiter { get; private set; }
-
-            private CancellationTokenRegistration tokenRegistration;
-            private CancellationTokenRegistration timeoutTokenRegistration;
-
-            public void Register(Action action)
-            {
-                tokenRegistration = Token.Register(action);
-            }
-
-            public void Dispose()
-            {
-                this.timeoutTokenRegistration.Dispose();
-                this.tokenRegistration.Dispose();
-            }
-        }
+        private readonly Dictionary<string, InFlightRequest> waitingRequests
+            = new Dictionary<string, InFlightRequest>(StringComparer.OrdinalIgnoreCase);
 
         // Prepare protocol messages for efficiency
         private byte[] PING_P_BYTES = null;
@@ -228,6 +169,9 @@ namespace NATS.Client
         private byte[] PUB_P_BYTES = null;
         private int    PUB_P_BYTES_LEN = 0;
 
+        private byte[] HPUB_P_BYTES = null;
+        private int    HPUB_P_BYTES_LEN = 0;
+
         private byte[] CRLF_BYTES = null;
         private int    CRLF_BYTES_LEN = 0;
 
@@ -236,7 +180,7 @@ namespace NATS.Client
         static readonly int REQ_CANCEL_IVL = 100;
 
         // 60 second default flush timeout
-        static readonly int DEFAULT_FLUSH_TIMEOUT = 60000;
+        static readonly int DEFAULT_FLUSH_TIMEOUT = 10000;
 
         TCPConnection conn = new TCPConnection();
 
@@ -336,7 +280,7 @@ namespace NATS.Client
             {
                 if (!disposedValue)
                 {
-#if NET45
+#if NET46
                     if (executorTask != null)
                         executorTask.Dispose();
 #endif
@@ -433,7 +377,10 @@ namespace NATS.Client
                         sslStream = null;
                     }
 
-                    client = new TcpClient();
+                    client = new TcpClient(Socket.OSSupportsIPv6 ? AddressFamily.InterNetworkV6 : AddressFamily.InterNetwork);
+                    if (Socket.OSSupportsIPv6)
+                        client.Client.DualMode = true;
+
                     var task = client.ConnectAsync(s.url.Host, s.url.Port);
                     // avoid raising TaskScheduler.UnobservedTaskException if the timeout occurs first
                     task.ContinueWith(t => GC.KeepAlive(t.Exception), TaskContinuationOptions.OnlyOnFaulted);
@@ -448,7 +395,7 @@ namespace NATS.Client
 
                     client.ReceiveBufferSize = Defaults.defaultBufSize*2;
                     client.SendBufferSize    = Defaults.defaultBufSize;
-
+                    
                     stream = client.GetStream();
 
                     // save off the hostname
@@ -470,14 +417,12 @@ namespace NATS.Client
 
             internal static void close(TcpClient c)
             {
-                if (c != null)
-                {
-#if NET45
-                    c.Close();
+#if NET46
+                    c?.Close();
 #else
-                    c.Dispose();
+                    c?.Dispose();
 #endif
-                }
+                c = null;
             }
 
             internal void makeTLS(Options options)
@@ -505,6 +450,7 @@ namespace NATS.Client
                     sslStream = null;
 
                     close(client);
+                    client = null;
                     throw new NATSConnectionException("TLS Authentication error", ex);
                 }
             }
@@ -515,6 +461,22 @@ namespace NATS.Client
                 {
                     if (client != null)
                         client.SendTimeout = value;
+                }
+            }
+
+            internal int ReceiveTimeout
+            {
+                get
+                {
+                    if(client == null)
+                        throw new InvalidOperationException("Connection not properly initialized.");
+
+                    return client.ReceiveTimeout;
+                }
+                set
+                {
+                    if (client != null)
+                        client.ReceiveTimeout = value;
                 }
             }
 
@@ -559,8 +521,8 @@ namespace NATS.Client
 
             internal Stream getWriteBufferedStream(int size)
             {
-                BufferedStream bs = null;
 
+                BufferedStream bs = null;
                 if (sslStream != null)
                     bs = new BufferedStream(sslStream, size);
                 else
@@ -605,7 +567,10 @@ namespace NATS.Client
                     if (stream != null)
                         stream.Dispose();
                     if (client != null)
+                    {
                         close(client);
+                        client = null;
+                    }
 
                     disposedValue = true;
                 }
@@ -667,7 +632,7 @@ namespace NATS.Client
                     // See Connection.deliverMsgs
                     Channel.close();
                     channelTask.Wait(500);
-#if NET45
+#if NET46
                     channelTask.Dispose();
 #endif
                     channelTask = null;
@@ -746,9 +711,6 @@ namespace NATS.Client
             return null;
         }
 
-        // Ensure we cannot instanciate a connection this way.
-        private Connection() { }
-
         /// <summary>
         /// Initializes a new instance of the <see cref="Connection"/> class
         /// with the specified <see cref="Options"/>.
@@ -758,7 +720,10 @@ namespace NATS.Client
         internal Connection(Options options)
         {
             opts = new Options(options);
-            pongs = createPongs();
+            if (opts.ReconnectDelayHandler == null)
+            {
+                opts.ReconnectDelayHandler = DefaultReconnectDelayHandler;
+            }
 
             PING_P_BYTES = Encoding.UTF8.GetBytes(IC.pingProto);
             PING_P_BYTES_LEN = PING_P_BYTES.Length;
@@ -769,19 +734,24 @@ namespace NATS.Client
             PUB_P_BYTES = Encoding.UTF8.GetBytes(IC._PUB_P_);
             PUB_P_BYTES_LEN = PUB_P_BYTES.Length;
 
+            HPUB_P_BYTES = Encoding.UTF8.GetBytes(IC._HPUB_P_);
+            HPUB_P_BYTES_LEN = HPUB_P_BYTES.Length;
+
             CRLF_BYTES = Encoding.UTF8.GetBytes(IC._CRLF_);
             CRLF_BYTES_LEN = CRLF_BYTES.Length;
 
             // predefine the start of the publish protocol message.
-            buildPublishProtocolBuffer(Defaults.scratchSize);
+            buildPublishProtocolBuffers(512);
 
             callbackScheduler.Start();
+
+            globalRequestInbox = NewInbox();
         }
 
-        private void buildPublishProtocolBuffer(int size)
+        private void buildPublishProtocolBuffers(int size)
         {
             pubProtoBuf = new byte[size];
-            Buffer.BlockCopy(PUB_P_BYTES, 0, pubProtoBuf, 0, PUB_P_BYTES_LEN);
+            Buffer.BlockCopy(HPUB_P_BYTES, 0, pubProtoBuf, 0, HPUB_P_BYTES_LEN);
         }
 
         // Ensures that pubProtoBuf is appropriately sized for the given
@@ -791,14 +761,14 @@ namespace NATS.Client
         {
             // Publish protocol buffer sizing:
             //
-            // PUB_P_BYTES_LEN (includes trailing space)
+            // HPUB_P_BYTES_LEN (includes trailing space)
             //  + SUBJECT field length
             //  + SIZE field maximum + 1 (= log(2147483647) + 1 = 11)
             //  + (optional) REPLY field length + 1
 
-            int pubProtoBufSize = PUB_P_BYTES_LEN
+            int pubProtoBufSize = HPUB_P_BYTES_LEN
                                 + (1 + subject.Length)
-                                + (11)
+                                + (34) // Include payload/header sizes and stamp
                                 + (reply != null ? reply.Length + 1 : 0);
 
             // only resize if we're increasing the buffer...
@@ -813,7 +783,7 @@ namespace NATS.Client
                 pubProtoBufSize |= pubProtoBufSize >> 16;
                 pubProtoBufSize++;
 
-                buildPublishProtocolBuffer(pubProtoBufSize);
+                buildPublishProtocolBuffers(pubProtoBufSize);
             }
         }
 
@@ -843,8 +813,9 @@ namespace NATS.Client
         // createConn will connect to the server and wrap the appropriate
         // bufio structures. It will do the right thing when an existing
         // connection is in place.
-        private bool createConn(Srv s)
+        private bool createConn(Srv s, out Exception ex)
         {
+            ex = null;
             try
             {
                 conn.open(s, opts.Timeout);
@@ -864,8 +835,9 @@ namespace NATS.Client
                 bw = conn.getWriteBufferedStream(Defaults.defaultBufSize);
                 br = conn.getReadBufferedStream();
             }
-            catch (Exception)
+            catch (Exception e)
             {
+                ex = e;
                 return false;
             }
 
@@ -876,6 +848,7 @@ namespace NATS.Client
         private void makeTLSConn()
         {
             conn.makeTLS(this.opts);
+
             bw = conn.getWriteBufferedStream(Defaults.defaultBufSize);
             br = conn.getReadBufferedStream();
         }
@@ -886,18 +859,23 @@ namespace NATS.Client
         {
             // Kick old flusher forcefully.
             setFlusherDone(true);
-            kickFlusher();
 
-            if (wg.Count > 0)
+            if (wg.Count <= 0)
+                return;
+
+            var cpy = wg.ToArray();
+
+            foreach (var t in cpy)
             {
                 try
                 {
-                    foreach (Thread t in wg)
-                    {
-                        t.Join();
-                    }
+                    t.Join();
+                    wg.Remove(t);
                 }
-                catch (Exception) { }
+                catch (Exception)
+                {
+                    // ignored
+                }
             }
         }
 
@@ -910,9 +888,7 @@ namespace NATS.Client
                     return;
                 }
 
-                pout++;
-
-                if (pout > Opts.MaxPingsOut)
+                if (Interlocked.Increment(ref pout) > Opts.MaxPingsOut)
                 {
                     processOpError(new NATSStaleConnectionException());
                     return;
@@ -944,7 +920,7 @@ namespace NATS.Client
         // caller must lock
         private void startPingTimer()
         {
-            pout = 0;
+            Interlocked.Exchange(ref pout, 0);
 
             stopPingTimer();
 
@@ -980,6 +956,7 @@ namespace NATS.Client
                 readLoopStartEvent.Set();
                 readLoop();
             });
+            t.IsBackground = true;
             t.Start();
             t.Name = generateThreadName("Reader");
             wg.Add(t);
@@ -989,6 +966,7 @@ namespace NATS.Client
                 flusherStartEvent.Set();
                 flusher();
             });
+            t.IsBackground = true;
             t.Start();
             t.Name = generateThreadName("Flusher");
             wg.Add(t);
@@ -1017,6 +995,27 @@ namespace NATS.Client
         }
 
         /// <summary>
+        /// Gets the IP of client as known by the NATS server, otherwise <c>null</c>.
+        /// </summary>
+        /// <remarks>
+        /// Supported in the NATS server version 2.1.6 and above.  If the client is connected to
+        /// an older server or is in the process of connecting, null will be returned.
+        /// </remarks>
+        public IPAddress ClientIP
+        {
+            get
+            {
+                string clientIp;
+                lock (mu)
+                {
+                    clientIp = info.client_ip;
+                }
+                
+                return !String.IsNullOrEmpty(clientIp) ? IPAddress.Parse(clientIp) : null;
+            }
+        }
+
+        /// <summary>
         /// Gets the server ID of the NATS server to which this instance
         /// is connected, otherwise <c>null</c>.
         /// </summary>
@@ -1029,7 +1028,7 @@ namespace NATS.Client
                     if (status != ConnState.CONNECTED)
                         return IC._EMPTY_;
 
-                    return this.info.serverId;
+                    return this.info.server_id;
                 }
             }
         }
@@ -1071,19 +1070,29 @@ namespace NATS.Client
             }
         }
 
-        private Queue<SingleUseChannel<bool>> createPongs()
-        {
-            return new Queue<SingleUseChannel<bool>>();
-        }
-
         // Process a connected connection and initialize properly.
         // Caller must lock.
-        private void processConnectInit()
+        private void processConnectInit(Srv s)
         {
             this.status = ConnState.CONNECTING;
 
-            processExpectedInfo();
-            sendConnect();
+            var orgTimeout = conn.ReceiveTimeout;
+
+            try
+            {
+                conn.ReceiveTimeout = opts.Timeout;
+                processExpectedInfo(s);
+                sendConnect();
+            }
+            catch (IOException ex)
+            {
+                throw new NATSConnectionException("Error while performing handshake with server. See inner exception for more details.", ex);
+            }
+            finally
+            {
+                if(conn.isSetup())
+                    conn.ReceiveTimeout = orgTimeout;
+            }
 
             // .NET vs go design difference here:
             // Starting the ping timer earlier allows us
@@ -1106,20 +1115,47 @@ namespace NATS.Client
             try
             {
                 exToThrow = null;
-                lock (mu)
+
+                NATSConnectionException natsAuthEx = null;
+
+                for(var i = 0; i < 6; i++) //Precaution to not end up in server returning ExTypeA, ExTypeB, ExTypeA etc.
                 {
-                    if (createConn(s))
+                    try
                     {
-                        processConnectInit();
-                        exToThrow = null;
-                        return true;
+                        lock (mu)
+                        {
+                            if (!createConn(s, out exToThrow))
+                                return false;
+
+                            processConnectInit(s);
+                            exToThrow = null;
+
+                            return true;
+                        }
+                    }
+                    catch (NATSConnectionException ex)
+                    {
+                        if (!ex.IsAuthorizationViolationError() && !ex.IsAuthenticationExpiredError())
+                            throw;
+
+                        var aseh = opts.AsyncErrorEventHandler;
+                        if (aseh != null)
+                            callbackScheduler.Add(() => aseh(s, new ErrEventArgs(this, null, ex.Message)));
+
+                        if (natsAuthEx == null || !natsAuthEx.Message.Equals(ex.Message, StringComparison.OrdinalIgnoreCase))
+                        {
+                            natsAuthEx = ex;
+                            continue;
+                        }
+
+                        throw;
                     }
                 }
             }
-            catch (Exception e)
+            catch (Exception ex)
             {
-                exToThrow = e;
-                close(ConnState.DISCONNECTED, false);
+                exToThrow = ex;
+                close(ConnState.DISCONNECTED, false, ex);
                 lock (mu)
                 {
                     url = null;
@@ -1143,10 +1179,11 @@ namespace NATS.Client
             {
                 if (status != ConnState.CONNECTED)
                 {
-                    if (exToThrow == null)
-                        exToThrow = new NATSNoServersException("Unable to connect to a server.");
-
-                    throw exToThrow;
+                    if (exToThrow is NATSException)
+                        throw exToThrow;
+                    if (exToThrow != null)
+                        throw new NATSConnectionException("Failed to connect", exToThrow);
+                    throw new NATSNoServersException("Unable to connect to a server.");
                 }
             }
         }
@@ -1154,21 +1191,24 @@ namespace NATS.Client
         // This will check to see if the connection should be
         // secure. This can be dictated from either end and should
         // only be called after the INIT protocol has been received.
-        private void checkForSecure()
+        private void checkForSecure(Srv s)
         {
             // Check to see if we need to engage TLS
             // Check for mismatch in setups
-            if (Opts.Secure && !info.tlsRequired)
+            if (Opts.Secure && !info.tls_required)
             {
                 throw new NATSSecureConnWantedException();
             }
-            else if (info.tlsRequired && !Opts.Secure)
+            else if (info.tls_required && !Opts.Secure)
             {
-                throw new NATSSecureConnRequiredException();
+                // If the server asks us to be secure, give it
+                // a shot.
+                Opts.Secure = true;
             }
 
-            // Need to rewrap with bufio
-            if (Opts.Secure)
+            // Need to rewrap with bufio if options tell us we need
+            // a secure connection or the tls url scheme was specified.
+            if (Opts.Secure || s.Secure)
             {
                 makeTLSConn();
             }
@@ -1177,7 +1217,7 @@ namespace NATS.Client
         // processExpectedInfo will look for the expected first INFO message
         // sent when a connection is established. The lock should be held entering.
         // Caller must lock.
-        private void processExpectedInfo()
+        private void processExpectedInfo(Srv s)
         {
             Control c;
 
@@ -1203,17 +1243,17 @@ namespace NATS.Client
 
             // do not notify listeners of server changes when we process the first INFO message
             processInfo(c.args, false);
-            checkForSecure();
+            checkForSecure(s);
         }
 
-        private void writeString(string format, object a, object b)
+        private void writeString(string format, string a, string b)
         {
-            writeString(String.Format(format, a, b));
+            writeString(string.Format(format, a, b));
         }
 
-        private void writeString(string format, object a, object b, object c)
+        private void writeString(string format, string a, string b, string c)
         {
-            writeString(String.Format(format, a, b, c));
+            writeString(string.Format(format, a, b, c));
         }
 
         private void writeString(string value)
@@ -1319,14 +1359,12 @@ namespace NATS.Client
             ConnectInfo info = new ConnectInfo(opts.Verbose, opts.Pedantic, userJWT, nkey, sig, user,
                 pass, token, opts.Secure, opts.Name, !opts.NoEcho);
 
-            StringBuilder sb = new StringBuilder();
-
-            sb.AppendFormat(IC.conProto, info.ToJson());
-
             if (opts.NoEcho && info.protocol < 1)
                 throw new NATSProtocolException("Echo is not supported by the server.");
 
-            return sb.ToString();
+            var sb = new StringBuilder().Append(IC.conProtoNoCRLF).Append(" ");
+
+            return info.AppendAsJsonTo(sb).Append(IC._CRLF_).ToString();
         }
 
 
@@ -1350,8 +1388,9 @@ namespace NATS.Client
             StreamReader sr = null;
             try
             {
+                // TODO:  Make this reader (or future equivalent) unbounded.
                 // we need the underlying stream, so leave it open.
-                sr = new StreamReader(br, Encoding.UTF8, false, 512, true);
+                sr = new StreamReader(br, Encoding.UTF8, false, Defaults.MaxControlLineSize, true);
                 result = sr.ReadLine();
 
                 // If opts.verbose is set, handle +OK.
@@ -1384,7 +1423,7 @@ namespace NATS.Client
                 else if (result.StartsWith(IC._ERR_OP_))
                 {
                     throw new NATSConnectionException(
-                        result.Substring(IC._ERR_OP_.Length));
+                        result.Substring(IC._ERR_OP_.Length).TrimStart(' '));
                 }
                 else
                 {
@@ -1401,7 +1440,7 @@ namespace NATS.Client
             // the string directly using the buffered reader.
             //
             // Keep the underlying stream open.
-            using (StreamReader sr = new StreamReader(br, Encoding.ASCII, false, 1024, true))
+            using (StreamReader sr = new StreamReader(br, Encoding.ASCII, false, Defaults.MaxControlLineSize, true))
             {
                 return new Control(sr.ReadLine());
             }
@@ -1433,10 +1472,17 @@ namespace NATS.Client
                     conn.teardown();
                 }
 
+                // clear any queued pongs, e..g. pending flush calls.
+                clearPendingFlushCalls();
+
+                pending = new MemoryStream();
+                bw = new BufferedStream(pending);
+
                 Thread t = new Thread(() =>
                 {
                     doReconnect();
                 });
+                t.IsBackground = true;
                 t.Name = generateThreadName("Reconnect");
                 t.Start();
             }
@@ -1451,7 +1497,7 @@ namespace NATS.Client
 
             if (pending.Length > 0)
             {
-#if NET45
+#if NET46
                 bw.Write(pending.GetBuffer(), 0, (int)pending.Length);
                 bw.Flush();
 #else
@@ -1481,16 +1527,23 @@ namespace NATS.Client
         // Schedules a connection event (connected/disconnected/reconnected)
         // if non-null.
         // Caller must lock.
-        private void scheduleConnEvent(EventHandler<ConnEventArgs> connEvent)
+        private void scheduleConnEvent(EventHandler<ConnEventArgs> connEvent, Exception error = null)
         {
             // Schedule a reference to the event handler.
             EventHandler<ConnEventArgs> eh = connEvent;
             if (eh != null)
             {
                 callbackScheduler.Add(
-                    () => { eh(this, new ConnEventArgs(this)); }
+                    () => { eh(this, new ConnEventArgs(this, error)); }
                 );
             }
+        }
+
+        private void DefaultReconnectDelayHandler(object o, ReconnectDelayEventArgs args)
+        {
+            int jitter = srvPool.HasSecureServer() ? random.Next(opts.ReconnectJitterTLS) : random.Next(opts.ReconnectJitter);
+
+            Thread.Sleep(opts.ReconnectWait + jitter);
         }
 
         // Try to reconnect using the option parameters.
@@ -1509,128 +1562,147 @@ namespace NATS.Client
             // sent out, but are still in the pipe.
 
             // Hold manually release where needed below.
-            Monitor.Enter(mu);
 
-            // clear any queued pongs, e..g. pending flush calls.
-            clearPendingFlushCalls();
+            var lockWasTaken = false;
 
-            pending = new MemoryStream();
-            bw = new BufferedStream(pending);
-
-            // Clear any errors.
-            lastEx = null;
-
-            scheduleConnEvent(Opts.DisconnectedEventHandler);
-
-            // TODO:  Look at using a predicate delegate in the server pool to
-            // pass a method to, but locking is complex and would need to be
-            // reworked.
-            Srv cur;
-            while ((cur = srvPool.SelectNextServer(Opts.MaxReconnect)) != null)
+            try
             {
-                url = cur.url;
+                Monitor.Enter(mu, ref lockWasTaken);
 
+                //Keep ref to any error before clearing.
+                var errorForHandler = lastEx;
                 lastEx = null;
 
-                // Sleep appropriate amount of time before the
-                // connection attempt if connecting to same server
-                // we just got disconnected from.
-                double elapsedMillis = cur.TimeSinceLastAttempt.TotalMilliseconds;
-                double sleepTime = 0;
+                scheduleConnEvent(Opts.DisconnectedEventHandler, errorForHandler);
 
-                if (elapsedMillis < Opts.ReconnectWait)
+                Srv cur;
+                int wlf = 0;
+                bool doSleep = false;
+                while ((cur = srvPool.SelectNextServer(Opts.MaxReconnect)) != null)
                 {
-                    sleepTime = Opts.ReconnectWait - elapsedMillis;
-                }
+                    // check if we've been through the list
+                    if (cur == srvPool.First())
+                    {
+                        doSleep = (wlf != 0);
+                        wlf++;
+                    }
+                    else
+                    {
+                        doSleep = false;
+                    }
 
-                if (sleepTime <= 0)
-                {
-                    // Release to allow parallel processes to close,
-                    // unsub, etc.  Note:  Use the sleep API - yield is
-                    // heavy handed here.
-                    sleepTime = 50;
-                }
-
-                Monitor.Exit(mu);
-                sleep((int)sleepTime);
-                Monitor.Enter(mu);
-
-                if (isClosed())
-                    break;
-
-                cur.reconnects++;
-
-                try
-                {
-                    // try to create a new connection
-                    createConn(cur);
-                }
-                catch (Exception)
-                {
-                    // not yet connected, retry and hold
-                    // the lock.
+                    url = cur.url;
                     lastEx = null;
-                    continue;
+
+                    if (lockWasTaken)
+                    {
+                        Monitor.Exit(mu);
+                        lockWasTaken = false;
+                    }
+
+                    if (doSleep)
+                    {
+                        try
+                        {
+                            // If unset, the default handler will be called which uses an
+                            // auto reset event to wait, unless kicked out of a close
+                            // call.
+                            opts?.ReconnectDelayHandler(this, new ReconnectDelayEventArgs(wlf - 1));
+                        }
+                        catch { } // swallow user exceptions
+                    }
+
+                    Monitor.Enter(mu, ref lockWasTaken);
+
+                    if (isClosed())
+                        break;
+
+                    cur.reconnects++;
+
+                    try
+                    {
+                        // try to create a new connection
+                        if(!createConn(cur, out lastEx))
+                            continue;
+                    }
+                    catch (Exception)
+                    {
+                        // not yet connected, retry and hold
+                        // the lock.
+                        lastEx = null;
+                        continue;
+                    }
+
+                    // process our connect logic
+                    try
+                    {
+                        processConnectInit(cur);
+                    }
+                    catch (Exception e)
+                    {
+                        lastEx = e;
+                        status = ConnState.RECONNECTING;
+                        continue;
+                    }
+
+                    try
+                    {
+                        // Send existing subscription state
+                        resendSubscriptions();
+
+                        // Now send off and clear pending buffer
+                        flushReconnectPendingItems();
+                    }
+                    catch (Exception)
+                    {
+                        status = ConnState.RECONNECTING;
+                        continue;
+                    }
+
+                    // We are reconnected.
+                    stats.reconnects++;
+                    cur.didConnect = true;
+                    cur.reconnects = 0;
+                    srvPool.CurrentServer = cur;
+                    status = ConnState.CONNECTED;
+
+                    scheduleConnEvent(Opts.ReconnectedEventHandler);
+
+                    // Release lock here, we will return below
+                    if (lockWasTaken)
+                    {
+                        Monitor.Exit(mu);
+                        lockWasTaken = false;
+                    }
+
+                    // Make sure to flush everything
+                    // We have a corner case where the server we just
+                    // connected to has failed as well - let the reader
+                    // thread detect this and spawn another reconnect 
+                    // thread to simplify locking.
+                    try
+                    {
+                        Flush();
+                    }
+                    catch
+                    {
+                        // ignored
+                    }
+
+                    return;
                 }
 
-                // process our connect logic
-                try
-                {
-                    processConnectInit();
-                }
-                catch (Exception e)
-                {
-                    lastEx = e;
-                    status = ConnState.RECONNECTING;
-                    continue;
-                }
+                // Call into close.. we have no more servers left..
+                if (lastEx == null)
+                    lastEx = new NATSNoServersException("Unable to reconnect");
 
-                try
-                {
-                    // Send existing subscription state
-                    resendSubscriptions();
-
-                    // Now send off and clear pending buffer
-                    flushReconnectPendingItems();
-                }
-                catch (Exception)
-                {
-                    status = ConnState.RECONNECTING;
-                    continue;
-                }
-
-                // We are reconnected.
-                stats.reconnects++;
-                cur.didConnect = true;
-                cur.reconnects = 0;
-                srvPool.CurrentServer = cur;
-                status = ConnState.CONNECTED;
-
-                scheduleConnEvent(Opts.ReconnectedEventHandler);
-
-                // Release lock here, we will return below
-                Monitor.Exit(mu);
-
-                // Make sure to flush everything
-                // We have a corner case where the server we just
-                // connected to has failed as well - let the reader
-                // thread detect this and spawn another reconnect 
-                // thread to simplify locking.
-                try
-                {
-                    Flush();
-                }
-                catch (Exception) { }
-
-                return;
+                Close();
             }
-
-            // Call into close.. we have no more servers left..
-            if (lastEx == null)
-                lastEx = new NATSNoServersException("Unable to reconnect");
-
-            Monitor.Exit(mu);
-            Close();
+            finally
+            {
+                if(lockWasTaken)
+                    Monitor.Exit(mu);
+            }
         }
 
         private bool isConnecting()
@@ -1671,8 +1743,8 @@ namespace NATS.Client
         {
             // Stack based buffer.
             byte[] buffer = new byte[Defaults.defaultReadLength];
-            Parser parser = new Parser(this);
-            int    len;
+            var parser = new Parser(this);
+            int len;
 
             while (true)
             {
@@ -1680,10 +1752,20 @@ namespace NATS.Client
                 {
                     len = br.Read(buffer, 0, Defaults.defaultReadLength);
 
-                    // Socket has been closed gracefully by host
+                    // A length of zero can mean that the socket was closed
+                    // locally by the application (Close) or the server
+                    // gracefully closed the socket.  There are some cases
+                    // on windows where a server could take an exit path that
+                    // gracefully closes sockets.  Throw an exception so we
+                    // can reconnect.  If the network stream has been closed
+                    // by the client, processOpError will do the right thing
+                    // (nothing).
                     if (len == 0)
                     {
-                        break;
+                        if (disposedValue || State == ConnState.CLOSED)
+                            break;
+
+                        throw new NATSConnectionException("Server closed the connection.");
                     }
 
                     parser.parse(buffer, len);
@@ -1694,6 +1776,7 @@ namespace NATS.Client
                     {
                         processOpError(e);
                     }
+
                     break;
                 }
             }
@@ -1732,7 +1815,10 @@ namespace NATS.Client
                     mm[ii] = null; // do not hold onto the Msg any longer than we need to
                     if (!m.sub.processMsg(m))
                     {
-                        removeSub(m.sub);
+                        lock (mu)
+                        {
+                            removeSub(m.sub);
+                        }
                     }
                 }
             }
@@ -1740,25 +1826,7 @@ namespace NATS.Client
 
         // Roll our own fast conversion - we know it's the right
         // encoding. 
-        char[] convertToStrBuf = new char[Defaults.scratchSize];
-
-        // Caller must ensure thread safety.
-        private string convertToString(byte[] buffer, long length)
-        {
-            // expand if necessary
-            if (length > convertToStrBuf.Length)
-            {
-                convertToStrBuf = new char[length];
-            }
-
-            for (int i = 0; i < length; i++)
-            {
-                convertToStrBuf[i] = (char)buffer[i];
-            }
-
-            // This is the copy operation for msg arg strings.
-            return new string(convertToStrBuf, 0, (int)length);
-        }
+        char[] convertToStrBuf = new char[Defaults.MaxControlLineSize];
 
         // Since we know we don't need to decode the protocol string,
         // just copy the chars into bytes.  This increased
@@ -1925,7 +1993,7 @@ namespace NATS.Client
         #endregion
 
         // Finds the ends of each token in the argument buffer.
-        private int[] argEnds = new int[4];
+        private int[] argEnds = new int[5];
         private int setMsgArgsAryOffsets(byte[] buffer, long length)
         {
             if (convertToStrBuf.Length < length)
@@ -1936,8 +2004,8 @@ namespace NATS.Client
             int count = 0;
             int i = 0;
 
-            // We only support 4 elements in this protocol version
-            for ( ; i < length && count < 4; i++)
+            // We support up to 5 elements in this protocol version
+            for ( ; i < length && count < 5; i++)
             {
                 convertToStrBuf[i] = (char)buffer[i];
                 if (buffer[i] == ' ')
@@ -1958,23 +2026,63 @@ namespace NATS.Client
         // place to hold them, until we create the message.
         //
         // These strings, once created, are never copied.
-        internal void processMsgArgs(byte[] buffer, long length)
+        internal void processHeaderMsgArgs(byte[] buffer, long length)
         {
             int argCount = setMsgArgsAryOffsets(buffer, length);
 
             switch (argCount)
             {
+                case 4:
+                    msgArgs.subject = new string(convertToStrBuf, 0, argEnds[0]);
+                    msgArgs.sid = ToInt64(buffer, argEnds[0] + 1, argEnds[1]);
+                    msgArgs.reply = null;
+                    msgArgs.hdr = (int)ToInt64(buffer, argEnds[1] + 1, argEnds[2]);
+                    msgArgs.size = (int)ToInt64(buffer, argEnds[2] + 1, argEnds[3]);
+                    break;
+                case 5:
+                    msgArgs.subject = new string(convertToStrBuf, 0, argEnds[0]);
+                    msgArgs.sid = ToInt64(buffer, argEnds[0] + 1, argEnds[1]);
+                    msgArgs.reply = new string(convertToStrBuf, argEnds[1] + 1, argEnds[2] - argEnds[1] - 1);
+                    msgArgs.hdr = (int)ToInt64(buffer, argEnds[2] + 1, argEnds[3]);
+                    msgArgs.size = (int)ToInt64(buffer, argEnds[3] + 1, argEnds[4]);
+                    break;
+                default:
+                    throw new NATSException("Unable to parse message arguments: " + Encoding.UTF8.GetString(buffer, 0, (int)length));
+            }
+
+            if (msgArgs.size < 0)
+            {
+                throw new NATSException("Invalid Message - Bad or Missing Size: " + Encoding.UTF8.GetString(buffer, 0, (int)length));
+            }
+            if (msgArgs.sid < 0)
+            {
+                throw new NATSException("Invalid Message - Bad or Missing Sid: " + Encoding.UTF8.GetString(buffer, 0, (int)length));
+            }
+            if (msgArgs.hdr < 0 || msgArgs.hdr > msgArgs.size)
+            {
+                throw new NATSException("Invalid Message - Bad or Missing Header Size: " + Encoding.UTF8.GetString(buffer, 0, (int)length));
+            }
+        }
+
+        // Same as above, except when we know there is no header.
+        internal void processMsgArgs(byte[] buffer, long length)
+        {
+            int argCount = setMsgArgsAryOffsets(buffer, length);
+            msgArgs.hdr = 0;
+
+            switch (argCount)
+            {
                 case 3:
                     msgArgs.subject = new string(convertToStrBuf, 0, argEnds[0]);
-                    msgArgs.sid     = ToInt64(buffer, argEnds[0] + 1, argEnds[1]);
-                    msgArgs.reply   = null;
-                    msgArgs.size    = (int)ToInt64(buffer, argEnds[1] + 1, argEnds[2]);
+                    msgArgs.sid = ToInt64(buffer, argEnds[0] + 1, argEnds[1]);
+                    msgArgs.reply = null;
+                    msgArgs.size = (int)ToInt64(buffer, argEnds[1] + 1, argEnds[2]);
                     break;
                 case 4:
                     msgArgs.subject = new string(convertToStrBuf, 0, argEnds[0]);
-                    msgArgs.sid     = ToInt64(buffer, argEnds[0] + 1, argEnds[1]);
-                    msgArgs.reply   = new string(convertToStrBuf, argEnds[1] + 1, argEnds[2] - argEnds[1] - 1);
-                    msgArgs.size    = (int)ToInt64(buffer, argEnds[2] + 1, argEnds[3]);
+                    msgArgs.sid = ToInt64(buffer, argEnds[0] + 1, argEnds[1]);
+                    msgArgs.reply = new string(convertToStrBuf, argEnds[1] + 1, argEnds[2] - argEnds[1] - 1);
+                    msgArgs.size = (int)ToInt64(buffer, argEnds[2] + 1, argEnds[3]);
                     break;
                 default:
                     throw new NATSException("Unable to parse message arguments: " + Encoding.UTF8.GetString(buffer, 0, (int)length));
@@ -2082,10 +2190,10 @@ namespace NATS.Client
 
                 } // lock s.mu
 
-            } // lock conn.mu
+                if (maxReached)
+                    removeSub(s);
 
-            if (maxReached)
-                removeSub(s);
+            } // lock conn.mu
         }
 
         // processSlowConsumer will set SlowConsumer state and fire the
@@ -2175,10 +2283,6 @@ namespace NATS.Client
                 if (val == false)
                     return;
 
-                // Yield for a millisecond.  This reduces resource contention,
-                // increasing throughput by about 50%.
-                Thread.Sleep(1);
-
                 lock (mu)
                 {
                     if (!isConnected())
@@ -2193,6 +2297,10 @@ namespace NATS.Client
                         catch (Exception) {  /* ignore */ }
                     }
                 }
+
+                // Yield for a millisecond.  This reduces resource contention,
+                // increasing throughput by about 50%.
+                Thread.Sleep(1);
             }
         }
 
@@ -2206,20 +2314,11 @@ namespace NATS.Client
         // processPong is used to process responses to the client's ping
         // messages. We use pings for the flush mechanism as well.
         internal void processPong()
-        {
-            SingleUseChannel<bool> ch = null;
-            lock (mu)
-            {
-                if (pongs.Count > 0)
-                    ch = pongs.Dequeue();
+        { 
+            if (pongs.TryDequeue(out var ch))
+                ch?.add(true);
 
-                pout = 0;
-            }
-
-            if (ch != null)
-            {
-                ch.add(true);
-            }
+            Interlocked.Exchange(ref pout, 0);
         }
 
         // processOK is a placeholder for processing OK messages.
@@ -2232,7 +2331,7 @@ namespace NATS.Client
         // processInfo is used to parse the info messages sent
         // from the server.
         // Caller must lock.
-        internal void processInfo(string json, bool notifyOnServerAddition)
+        internal void processInfo(string json, bool notify)
         {
             if (json == null || IC._EMPTY_.Equals(json))
             {
@@ -2240,8 +2339,13 @@ namespace NATS.Client
             }
 
             info = ServerInfo.CreateFromJson(json);
-            var discoveredUrls = info.connectURLs;
- 
+            var discoveredUrls = info.connect_urls;
+
+            // The discoveredUrls array could be empty/not present on initial
+            // connect if advertise is disabled on that server, or servers that
+            // did not include themselves in the async INFO protocol.
+            // If empty, do not remove the implicit servers from the pool.  
+
             // Note about pool randomization: when the pool was first created,
             // it was randomized (if allowed). We keep the order the same (removing
             // implicit servers that are no longer sent to us). New URLs are sent
@@ -2253,10 +2357,15 @@ namespace NATS.Client
                 // the entire list.
                 srvPool.PruneOutdatedServers(discoveredUrls);
                 var serverAdded = srvPool.Add(discoveredUrls, true);
-                if (notifyOnServerAddition && serverAdded)
+                if (notify && serverAdded)
                 {
                     scheduleConnEvent(opts.ServerDiscoveredEventHandler);
                 }
+            }
+
+            if (notify && info.ldm && opts.LameDuckModeEventHandler != null)
+            {
+                scheduleConnEvent(opts.LameDuckModeEventHandler);
             }
         }
 
@@ -2313,7 +2422,7 @@ namespace NATS.Client
                     }
                 }
 
-                close(ConnState.CLOSED, invokeDelegates);
+                close(ConnState.CLOSED, invokeDelegates, ex);
             }
         }
 
@@ -2327,10 +2436,65 @@ namespace NATS.Client
 
         // Use low level primitives to build the protocol for the publish
         // message.
-        private int writePublishProto(byte[] dst, string subject, string reply, int msgSize)
+        //
+        // HPUB<SUBJ>[REPLY] <HDR_LEN> <TOT_LEN>
+        // <HEADER><PAYLOAD>
+        // For example:
+        // HPUB SUBJECT REPLY 23 30␍␊NATS/1.0␍␊Header: X␍␊␍␊PAYLOAD␍␊
+        // HPUB SUBJECT REPLY 23 23␍␊NATS/1.0␍␊Header: X␍␊␍␊␍␊
+        private void WriteHPUBProto(byte[] dst, string subject, string reply, int headerSize, int msgSize,
+            out int length, out int offset)
         {
-            // skip past the predefined "PUB "
-            int index = PUB_P_BYTES_LEN;
+            // skip past the predefined "HPUB "
+            int index = HPUB_P_BYTES_LEN;
+
+            // Subject
+            index = writeStringToBuffer(dst, index, subject);
+
+            if (reply != null)
+            {
+                // " REPLY"
+                dst[index] = (byte)' ';
+                index++;
+
+                index = writeStringToBuffer(dst, index, reply);
+            }
+
+            // " HEADERSIZE"
+            dst[index] = (byte)' ';
+            index++;
+            index = writeInt32ToBuffer(dst, index, headerSize);
+
+            // " TOTALSIZE"
+            dst[index] = (byte)' ';
+            index++;
+            index = writeInt32ToBuffer(dst, index, msgSize+headerSize);
+
+            // "\r\n"
+            dst[index] = CRLF_BYTES[0];
+            dst[index + 1] = CRLF_BYTES[1];
+            if (CRLF_BYTES_LEN > 2)
+            {
+                for (int i = 2; i < CRLF_BYTES_LEN; ++i)
+                    dst[index + i] = CRLF_BYTES[i];
+            }
+            index += CRLF_BYTES_LEN;
+
+            length = index;
+            offset = 0;
+        }
+
+        // The pubProtoBuf will always start with HPUB... with the
+        // rest of the protocol representing a standard publish or
+        // header publish.  If a standard publish, we must skip the H
+        // to create a PUB protocol message, and reduce the length.
+        // We write as if it's a HPUB, but adjust the returned offset
+        // and length so the future write will ignore the H.
+        private void WritePUBProto(byte[] dst, string subject, string reply, int msgSize,
+            out int length, out int offset)
+        {
+            // skip past the predefined "HPUB "
+            int index = HPUB_P_BYTES_LEN;
 
             // Subject
             index = writeStringToBuffer(dst, index, subject);
@@ -2361,13 +2525,14 @@ namespace NATS.Client
             }
             index += CRLF_BYTES_LEN;
 
-            return index;
+            length = index-1;
+            offset = 1;
         }
 
         // publish is the internal function to publish messages to a nats-server.
         // Sends a protocol data message by queueing into the bufio writer
         // and kicking the flush go routine. These writes should be protected.
-        internal void publish(string subject, string reply, byte[] data, int offset, int count)
+        internal void publish(string subject, string reply, byte[] headers, byte[] data, int offset, int count, bool flushBuffer)
         {
             if (string.IsNullOrWhiteSpace(subject))
             {
@@ -2395,7 +2560,7 @@ namespace NATS.Client
                     throw new NATSConnectionDrainingException();
 
                 // Proactively reject payloads over the threshold set by server.
-                if (count > info.maxPayload)
+                if (count > info.max_payload)
                     throw new NATSMaxPayloadException();
 
                 if (lastEx != null)
@@ -2403,10 +2568,52 @@ namespace NATS.Client
 
                 ensurePublishProtocolBuffer(subject, reply);
 
-                // write our pubProtoBuf buffer to the buffered writer.
-                int pubProtoLen = writePublishProto(pubProtoBuf, subject, reply, count);
+                // protoLen and protoOffset provide a length and offset for
+                // copying the publish protocol buffer.  This is to avoid extra
+                // copies or use of multiple publish protocol buffers.
+                int protoLen;
+                int protoOffset;
+                if (headers != null)
+                {
+                    if (info.headers == false)
+                    {
+                        throw new NATSNotSupportedException("Headers are not supported by the server.");
+                    }
+                    WriteHPUBProto(pubProtoBuf, subject, reply, headers.Length, count, out protoLen, out protoOffset);
+                }
+                else
+                {
+                    WritePUBProto(pubProtoBuf, subject, reply, count, out protoLen, out protoOffset);
+                }
 
-                bw.Write(pubProtoBuf, 0, pubProtoLen);
+                // Check if we are reconnecting, and if so check if
+                // we have exceeded our reconnect outbound buffer limits.
+                // Don't use IsReconnecting to avoid locking.
+                if (status == ConnState.RECONNECTING)
+                {
+                    int rbsize = opts.ReconnectBufferSize;
+                    if (rbsize != 0)
+                    {
+                        if (rbsize == -1)
+                            throw new NATSReconnectBufferException("Reconnect buffering has been disabled.");
+
+                        if (flushBuffer)
+                            bw.Flush();
+                        else
+                            kickFlusher();
+
+                        if (pending != null && bw.Position + count + protoLen > rbsize)
+                            throw new NATSReconnectBufferException("Reconnect buffer exceeded.");
+                    }
+                }
+
+                bw.Write(pubProtoBuf, protoOffset, protoLen);
+
+                if (headers != null)
+                {
+                    bw.Write(headers, 0, headers.Length);
+                    stats.outBytes += headers.Length;
+                }
 
                 if (count > 0)
                 {
@@ -2418,7 +2625,14 @@ namespace NATS.Client
                 stats.outMsgs++;
                 stats.outBytes += count;
 
-                kickFlusher();
+                if (flushBuffer)
+                {
+                    bw.Flush();
+                }
+                else
+                {
+                    kickFlusher();
+                }
             }
 
         } // publish
@@ -2441,7 +2655,7 @@ namespace NATS.Client
         public void Publish(string subject, byte[] data)
         {
             int count = data != null ? data.Length : 0;
-            publish(subject, null, data, 0, count);
+            publish(subject, null, null, data, 0, count, false);
         }
 
         /// <summary>
@@ -2457,7 +2671,7 @@ namespace NATS.Client
         /// <seealso cref="IConnection.Publish(string, byte[])"/>
         public void Publish(string subject, byte[] data, int offset, int count)
         {
-            publish(subject, null, data, offset, count);
+            publish(subject, null, null, data, offset, count, false);
         }
 
         /// <summary>
@@ -2483,7 +2697,8 @@ namespace NATS.Client
             }
 
             int count = msg.Data != null ? msg.Data.Length : 0;
-            publish(msg.Subject, msg.Reply, msg.Data, 0, count);
+            byte[] headers = msg.header != null ? msg.header.ToByteArray() : null;
+            publish(msg.Subject, msg.Reply, headers, msg.Data, 0, count, false);
         }
 
         /// <summary>
@@ -2505,7 +2720,7 @@ namespace NATS.Client
         public void Publish(string subject, string reply, byte[] data)
         {
             int count = data != null ? data.Length : 0;
-            publish(subject, reply, data, 0, count);
+            publish(subject, reply, null, data, 0, count, false);
         }
 
         /// <summary>
@@ -2522,230 +2737,194 @@ namespace NATS.Client
         /// <seealso cref="IConnection.Publish(string, byte[])"/>
         public void Publish(string subject, string reply, byte[] data, int offset, int count)
         {
-            publish(subject, reply, data, offset, count);
+            publish(subject, reply, null, data, offset, count, false);
         }
 
-        internal virtual Msg request(string subject, byte[] data, int offset, int count, int timeout)
+        protected Msg request(string subject, byte[] headers, byte[] data, int offset, int count, int timeout) => requestSync(subject, headers, data, offset, count, timeout);
+
+        private void RemoveOutstandingRequest(string requestId)
         {
-            Msg result = null;
-
-            if (string.IsNullOrWhiteSpace(subject))
+            lock (mu)
             {
-                throw new NATSBadSubscriptionException();
+                waitingRequests.Remove(requestId);
             }
-            else if (timeout == 0)
-            {
-                // a timeout of 0 will never succeed - do not allow it.
-                throw new ArgumentException("Timeout must not be 0.", "timeout");
-            }
-            // offset/count checking covered by publish
+        }
 
-            if (!opts.UseOldRequestStyle)
-            {
-                var request = requestSync(subject, data, offset, count, timeout, CancellationToken.None);
+        private static bool IsNoRespondersMsg(Msg m)
+        {
+            return m != null && m.HasHeaders &&
+                MsgHeader.NoResponders.Equals(m.Header[MsgHeader.Status]) &&
+                m.Data.Length == 0;
+        }
 
-                try
+        private void RequestResponseHandler(object sender, MsgHandlerEventArgs args)
+        {
+            InFlightRequest request;
+            bool isClosed;
+
+            if (args.Message == null)
+                return;
+
+            var subject = args.Message.Subject;
+
+            lock (mu)
+            {
+                // if it's a typical response, process normally.
+                if (subject.StartsWith(globalRequestInbox))
                 {
-                    Flush(timeout > 0 ? timeout : DEFAULT_FLUSH_TIMEOUT);
-                    request.Waiter.Task.Wait(timeout);
-                    result = request.Waiter.Task.Result;
+                    //               \
+                    //               \/
+                    //  _INBOX.<nuid>.<requestId>
+                    var requestId = subject.Substring(globalRequestInbox.Length + 1);
+                    if (!waitingRequests.TryGetValue(requestId, out request))
+                        return;
                 }
-                catch (AggregateException ae)
+                else
                 {
-                    foreach (var e in ae.Flatten().InnerExceptions)
+                    // We have a jetstream subject (remapped), so if there's only one
+                    // request assume we're OK and handle it.
+                    if (waitingRequests.Count == 1)
                     {
-                        // we *should* only have one, and it should be
-                        // a NATS timeout exception.
-                        throw e;
+                        InFlightRequest[] values = new InFlightRequest[1];
+                        waitingRequests.Values.CopyTo(values, 0);
+                        request = values[0];
+
+                    }
+                    else
+                    {
+                        // if we get here, we have multiple outsanding jetstream
+                        // requests.  We can't tell which is which we'll punt.
+                        return;
                     }
                 }
-                catch
-                {
-                    // Could be a timeout or exception from the flush.
-                    throw;
-                }
-                finally
-                {
-                    removeOutstandingRequest(request.Id);
-                }
 
-                return result;
-            }
-            else
-            {
-                return oldRequest(subject, data, offset, count, timeout);
-            }
-        }
-
-        private InFlightRequest setupRequest(int timeout, CancellationToken token)
-        {
-            InFlightRequest request = new InFlightRequest(token, timeout);
-            // avoid raising TaskScheduler.UnobservedTaskException if the timeout occurs first
-            request.Waiter.Task.ContinueWith(t => GC.KeepAlive(t.Exception), TaskContinuationOptions.OnlyOnFaulted);
-            bool createSub = false;
-            lock (mu)
-            {
-                if (globalRequestSubReady == null)
-                {
-                    globalRequestSubReady = new TaskCompletionSource<object>();
-
-                    globalRequestInbox = NewInbox();
-
-                    createSub = true;
-                }
-
-                if (nextRequestId < 0)
-                {
-                    nextRequestId = 0;
-                }
-
-                request.Id = (nextRequestId++).ToString(CultureInfo.InvariantCulture);
-                request.Register(() => removeOutstandingRequest(request.Id));
-
-                waitingRequests.Add(
-                    request.Id,
-                    request);
-            }
-
-            if (createSub)
-            {
-                globalRequestSubscription = subscribeAsync(globalRequestInbox + ".*", null, requestResponseHandler);
-
-                globalRequestSubReady.TrySetResult(null);
-            }
-
-            return request;
-        }
-
-        private InFlightRequest requestSync(string subject, byte[] data, int offset, int count, int timeout, CancellationToken token)
-        {
-            InFlightRequest request = setupRequest(timeout, token);
-
-            request.Token.ThrowIfCancellationRequested();
-
-            try
-            {
-                if (globalRequestSubscription == null)
-                    globalRequestSubReady.Task.Wait(timeout, request.Token);
-
-                publish(subject, globalRequestInbox + "." + request.Id, data, offset, count);
-            }
-            catch
-            {
-                removeOutstandingRequest(request.Id);
-                throw;
-            }
-
-            return request;
-        }
-
-        private Task<Msg> requestAsync(string subject, byte[] data, int offset, int count, int timeout, CancellationToken token)
-        {
-            if (string.IsNullOrWhiteSpace(subject))
-            {
-                throw new NATSBadSubscriptionException();
-            }
-            else if (timeout == 0)
-            {
-                // a timeout of 0 will never succeed - do not allow it.
-                throw new ArgumentException("Timeout must not be 0.", "timeout");
-            }
-            // offset/count checking covered by publish
-
-            if (!opts.UseOldRequestStyle)
-            {
-                return Task.Run(
-                    async () =>
-                    {
-                        InFlightRequest request = setupRequest(timeout, token);
-
-                        request.Token.ThrowIfCancellationRequested();
-
-                        try
-                        {
-                            if (globalRequestSubscription == null)
-                                await globalRequestSubReady.Task;
-
-                            publish(subject, globalRequestInbox + "." + request.Id, data, offset, count);
-
-                            Flush(timeout > 0 ? timeout : DEFAULT_FLUSH_TIMEOUT);
-                        }
-                        catch
-                        {
-                            removeOutstandingRequest(request.Id);
-                            throw;
-                        }
-
-                    // InFlightRequest links the token cancellation
-                    return await request.Waiter.Task;
-                    },
-                    token);
-            }
-            else
-            {
-                return oldRequestAsync(subject, data, offset, count, timeout, token);
-            }
-        }
-
-        private void requestResponseHandler(object sender, MsgHandlerEventArgs e)
-        {
-            //               \
-            //               \/
-            //  _INBOX.<nuid>.<requestId>
-            string requestId = e.Message.Subject.Substring(globalRequestInbox.Length + 1);
-            if (e.Message == null)
-            {
-                return;
-            }
-
-            bool isClosed;
-            InFlightRequest request;
-            lock (mu)
-            {
                 isClosed = this.isClosed();
-
-                if (!waitingRequests.TryGetValue(requestId, out request))
-                {
-                    return;
-                }
-
-                waitingRequests.Remove(requestId);
             }
 
             if (!isClosed)
             {
-                request.Waiter.SetResult(e.Message);
+                if (IsNoRespondersMsg(args.Message))
+                {
+                    request.Waiter.TrySetException(new NATSNoRespondersException());
+                }
+                else
+                {
+                    request.Waiter.TrySetResult(args.Message);
+                }
             }
             else
             {
-                request.Waiter.SetCanceled();
+                request.Waiter.TrySetCanceled();
             }
             request.Dispose();
         }
 
-        private void removeOutstandingRequest(string requestId)
+        private InFlightRequest setupRequest(int timeout, CancellationToken token)
         {
+            var requestId = Interlocked.Increment(ref nextRequestId);
+            if (requestId < 0) //Check if recycled
+                requestId = (requestId + long.MaxValue + 1);
+
+            var request = new InFlightRequest(requestId.ToString(CultureInfo.InvariantCulture), token, timeout, RemoveOutstandingRequest);
+            request.Waiter.Task.ContinueWith(t => GC.KeepAlive(t.Exception), TaskContinuationOptions.OnlyOnFaulted);
+
             lock (mu)
             {
-                // this is fine even if requestId does not exist
-                waitingRequests.Remove(requestId);
+                // We shouldn't ever get an Argument exception because the ID is incrementing
+                // and since this is performant sensitive code, skipping an existence check.
+                waitingRequests.Add(request.Id, request);
+
+                if (globalRequestSubscription != null)
+                    return request;
+
+                if (globalRequestSubscription == null)
+                    globalRequestSubscription = subscribeAsync(string.Concat(globalRequestInbox, ".*"), null,
+                        RequestResponseHandler);
+            }
+
+            return request;
+        }
+
+        private Msg requestSync(string subject, byte[] headers, byte[] data, int offset, int count, int timeout)
+        {
+            if (string.IsNullOrWhiteSpace(subject))
+                throw new NATSBadSubscriptionException();
+            
+            // a timeout of 0 will never succeed - do not allow it.
+            if (timeout == 0)
+                throw new ArgumentException("Timeout must not be 0.", nameof(timeout));
+
+            // offset/count checking covered by publish
+            Msg m;
+            if (opts.UseOldRequestStyle)
+            {
+                m = oldRequest(subject, headers, data, offset, count, timeout);
+            }
+            else
+            {
+
+                using (var request = setupRequest(timeout, CancellationToken.None))
+                {
+                    request.Token.ThrowIfCancellationRequested();
+
+                    publish(subject, string.Concat(globalRequestInbox, ".", request.Id), headers, data, offset, count, true);
+
+                    m = request.Waiter.Task.GetAwaiter().GetResult();
+                }
+            }
+
+            if (IsNoRespondersMsg(m))
+            {
+                throw new NATSNoRespondersException();
+            }
+
+            return m;
+        }
+
+        private async Task<Msg> requestAsync(string subject, byte[] headers, byte[] data, int offset, int count, int timeout, CancellationToken token)
+        {
+            if (string.IsNullOrWhiteSpace(subject))
+                throw new NATSBadSubscriptionException();
+
+            // a timeout of 0 will never succeed - do not allow it.
+            if (timeout == 0)
+                throw new ArgumentException("Timeout must not be 0.", nameof(timeout));
+
+            // offset/count checking covered by publish
+
+            if (opts.UseOldRequestStyle)
+                return await oldRequestAsync(subject, headers, data, offset, count, timeout, token).ConfigureAwait(false);
+
+            using (var request = setupRequest(timeout, token))
+            {
+                request.Token.ThrowIfCancellationRequested();
+
+                publish(subject, string.Concat(globalRequestInbox, ".", request.Id), headers, data, offset, count, true);
+
+                // InFlightRequest links the token cancellation
+                return await request.Waiter.Task.ConfigureAwait(false);
             }
         }
 
-        private Msg oldRequest(string subject, byte[] data, int offset, int count, int timeout)
+        private Msg oldRequest(string subject, byte[] headers, byte[] data, int offset, int count, int timeout)
         {
-            Msg    m     = null;
-            string inbox = NewInbox();
+            var inbox = NewInbox();
 
-            SyncSubscription s = subscribeSync(inbox, null);
-            s.AutoUnsubscribe(1);
+            using (var s = subscribeSync(inbox, null))
+            {
+                s.AutoUnsubscribe(1);
 
-            publish(subject, inbox, data, offset, count);
-            Flush(timeout > 0 ? timeout : DEFAULT_FLUSH_TIMEOUT);
-            m = s.NextMessage(timeout);
-            s.unsubscribe(false);
+                publish(subject, inbox, headers, data, offset, count, true);
+                var m = s.NextMessage(timeout);
+                s.unsubscribe(false);
 
-            return m;
+                if (IsNoRespondersMsg(m))
+                {
+                    throw new NATSNoRespondersException();
+                }
+
+                return m;
+            }
         }
 
         /// <summary>
@@ -2773,13 +2952,14 @@ namespace NATS.Client
         /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
         /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the 
         /// response.</exception>
+        /// <exception cref="NATSNoRespondersException">No responders are available for this request.</exception>
         /// <exception cref="NATSException">There was an unexpected exception performing an internal NATS call
         /// while executing the request. See <see cref="Exception.InnerException"/> for more details.</exception>
         /// <exception cref="IOException">There was a failure while writing to the network.</exception>
         public Msg Request(string subject, byte[] data, int timeout)
         {
             int count = data != null ? data.Length : 0;
-            return request(subject, data, 0, count, timeout);
+            return request(subject, null, data, 0, count, timeout);
         }
 
         /// <summary>
@@ -2804,7 +2984,7 @@ namespace NATS.Client
         /// <seealso cref="IConnection.Request(string, byte[])"/>
         public Msg Request(string subject, byte[] data, int offset, int count, int timeout)
         {
-            return request(subject, data, offset, count, timeout);
+            return request(subject, null, data, offset, count, timeout);
         }
 
         /// <summary>
@@ -2828,13 +3008,14 @@ namespace NATS.Client
         /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
         /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the
         /// response.</exception>
+        /// <exception cref="NATSNoRespondersException">No responders are available for this request.</exception>
         /// <exception cref="NATSException">There was an unexpected exception performing an internal NATS call while
         /// executing the request. See <see cref="Exception.InnerException"/> for more details.</exception>
         /// <exception cref="IOException">There was a failure while writing to the network.</exception>
         public Msg Request(string subject, byte[] data)
         {
             int count = data != null ? data.Length : 0;
-            return request(subject, data, 0, count, Timeout.Infinite);
+            return request(subject, null, data, 0, count, Timeout.Infinite);
         }
 
         /// <summary>
@@ -2855,22 +3036,112 @@ namespace NATS.Client
         /// the current connection.</param>
         /// <param name="data">An array of type <see cref="Byte"/> that contains the request data to publish
         /// to the connected NATS server.</param>
+        /// <exception cref="NATSMaxPayloadException"><paramref name="data"/> exceeds the maximum payload size 
+        /// supported by the NATS server.</exception>
         /// <param name="offset">The zero-based byte offset in <paramref name="data"/> at which to begin publishing
         /// bytes to the subject.</param>
         /// <param name="count">The number of bytes to be published to the subject.</param>
         /// <returns>A <see cref="Msg"/> with the response from the NATS server.</returns>
+        /// <exception cref="NATSBadSubscriptionException"><paramref name="subject"/> is <c>null</c> or 
+        /// entirely whitespace.</exception>
+        /// <exception cref="NATSMaxPayloadException"><paramref name="data"/> exceeds the maximum payload size 
+        /// supported by the NATS server.</exception>
+        /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
+        /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the
+        /// response.</exception>
+        /// <exception cref="NATSNoRespondersException">No responders are available for this request.</exception>
+        /// <exception cref="NATSException">There was an unexpected exception performing an internal NATS call while
+        /// executing the request. See <see cref="Exception.InnerException"/> for more details.</exception>
+        /// <exception cref="IOException">There was a failure while writing to the network.</exception>
         public Msg Request(string subject, byte[] data, int offset, int count)
         {
-            return request(subject, data, offset, count, Timeout.Infinite);
+            return request(subject, null, data, offset, count, Timeout.Infinite);
         }
 
-        internal virtual Task<Msg> oldRequestAsync(string subject, byte[] data, int offset, int count, int timeout, CancellationToken ct)
+        /// <summary>
+        /// Sends a request payload and returns the response <see cref="Msg"/>, or throws
+        /// <see cref="NATSTimeoutException"/> if the <paramref name="timeout"/> expires.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="Request(Msg)"/> will create an unique inbox for this request, sharing a single
+        /// subscription for all replies to this <see cref="Connection"/> instance. However, if 
+        /// <see cref="Options.UseOldRequestStyle"/> is set, each request will have its own underlying subscription. 
+        /// The old behavior is not recommended as it may cause unnecessary overhead on connected NATS servers.
+        /// </remarks>
+        /// <param name="message">A NATS <see cref="Msg"/> that contains the request data to publish
+        /// to the connected NATS server.  The reply subject will be overridden.</param>
+        /// <param name="timeout">The number of milliseconds to wait.</param>
+        /// <returns>A <see cref="Msg"/> with the response from the NATS server.</returns>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="timeout"/> is less than or equal to zero 
+        /// (<c>0</c>).</exception>
+        /// <exception cref="ArgumentNullException"><paramref name="message"/> is null.</exception>
+        /// <exception cref="NATSBadSubscriptionException">The <paramref name="message"/> subject is <c>null</c>
+        /// or entirely whitespace.</exception>
+        /// <exception cref="NATSMaxPayloadException"><paramref name="message"/> payload exceeds the maximum payload size 
+        /// supported by the NATS server.</exception>
+        /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
+        /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the 
+        /// response.</exception>
+        /// <exception cref="NATSNoRespondersException">No responders are available for this request.</exception>
+        /// <exception cref="NATSException">There was an unexpected exception performing an internal NATS call
+        /// while executing the request. See <see cref="Exception.InnerException"/> for more details.</exception>
+        /// <exception cref="IOException">There was a failure while writing to the network.</exception>
+        public Msg Request(Msg message, int timeout)
+        {
+            if (message == null)
+            {
+                throw new ArgumentNullException("message");
+            }
+
+            byte[] headerBytes = message.header?.ToByteArray();
+            byte[] data = message.Data;
+            int count = data != null ? data.Length : 0;
+            return request(message.Subject, headerBytes, data, 0, count, timeout);
+        }
+
+        /// <summary>
+        /// Sends a request payload and returns the response <see cref="Msg"/>.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="Request(Msg)"/> will create an unique inbox for this request, sharing a single
+        /// subscription for all replies to this <see cref="Connection"/> instance. However, if 
+        /// <see cref="Options.UseOldRequestStyle"/> is set, each request will have its own underlying subscription. 
+        /// The old behavior is not recommended as it may cause unnecessary overhead on connected NATS servers.
+        /// </remarks>
+        /// <param name="message">A NATS <see cref="Msg"/> that contains the request data to publish
+        /// to the connected NATS server.  The reply subject will be overridden.</param>
+        /// <returns>A <see cref="Msg"/> with the response from the NATS server.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="message"/> is null.</exception>
+        /// <exception cref="NATSBadSubscriptionException">The <paramref name="message"/> subject is <c>null</c>
+        /// or entirely whitespace.</exception>
+        /// <exception cref="NATSMaxPayloadException"><paramref name="message"/> payload exceeds the maximum payload size 
+        /// supported by the NATS server.</exception>
+        /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
+        /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the
+        /// response.</exception>
+        /// <exception cref="NATSNoRespondersException">No responders are available for this request.</exception>
+        /// <exception cref="NATSException">There was an unexpected exception performing an internal NATS call while
+        /// executing the request. See <see cref="Exception.InnerException"/> for more details.</exception>
+        /// <exception cref="IOException">There was a failure while writing to the network.</exception>
+        public Msg Request(Msg message)
+        {
+            if (message == null)
+            {
+                throw new ArgumentNullException("message");
+            }
+
+            byte[] headerBytes = message.header?.ToByteArray();
+            byte[] data = message.Data;
+            int count = data != null ? data.Length : 0;
+            return request(message.Subject, headerBytes, data, 0, count, Timeout.Infinite);
+        }
+
+
+        private Task<Msg> oldRequestAsync(string subject, byte[] headers, byte[] data, int offset, int count, int timeout, CancellationToken ct)
         {
             // Simple case without a cancellation token.
-            if (ct == null)
-            {
-                return Task.Run(() => oldRequest(subject, data, offset, count, timeout));
-            }
+            if (ct == CancellationToken.None)
+                return Task.Run(() => oldRequest(subject, headers, data, offset, count, timeout), ct);
 
             // More complex case, supporting cancellation.
             return Task.Run(() =>
@@ -2888,8 +3159,7 @@ namespace NATS.Client
                 SyncSubscription s = subscribeSync(inbox, null);
                 s.AutoUnsubscribe(1);
 
-                publish(subject, inbox, data, offset, count);
-                Flush(timeout > 0 ? timeout: DEFAULT_FLUSH_TIMEOUT);
+                publish(subject, inbox, headers, data, offset, count, true);
 
                 int timeRemaining = timeout;
 
@@ -2922,6 +3192,11 @@ namespace NATS.Client
                                 s.unsubscribe(false);
                                 throw;
                             }
+                        }
+
+                        if (IsNoRespondersMsg(m))
+                        {
+                            throw new NATSNoRespondersException();
                         }
                     }
                 }
@@ -2965,6 +3240,7 @@ namespace NATS.Client
         /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
         /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the
         /// response.</exception>
+        /// <exception cref="NATSNoRespondersException">No responders are available for this request.</exception>
         /// <exception cref="NATSException">There was an unexpected exception performing an internal NATS call
         /// while executing the request. See <see cref="Exception.InnerException"/> for more details.</exception>
         /// <exception cref="OperationCanceledException">The asynchronous operation was cancelled or timed out before
@@ -2973,7 +3249,7 @@ namespace NATS.Client
         public Task<Msg> RequestAsync(string subject, byte[] data, int timeout)
         {
             int count = data != null ? data.Length : 0;
-            return requestAsync(subject, data, 0, count, timeout, CancellationToken.None);
+            return requestAsync(subject, null, data, 0, count, timeout, CancellationToken.None);
         }
 
         /// <summary>
@@ -2999,7 +3275,7 @@ namespace NATS.Client
         /// <seealso cref="IConnection.Request(string, byte[])"/>
         public Task<Msg> RequestAsync(string subject, byte[] data, int offset, int count, int timeout)
         {
-            return requestAsync(subject, data, offset, count, timeout, CancellationToken.None);
+            return requestAsync(subject, null, data, offset, count, timeout, CancellationToken.None);
         }
 
         /// <summary>
@@ -3025,6 +3301,7 @@ namespace NATS.Client
         /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
         /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the
         /// response.</exception>
+        /// <exception cref="NATSNoRespondersException">No responders are available for this request.</exception>
         /// <exception cref="NATSException">There was an unexpected exception performing an internal NATS call while
         /// executing the request. See <see cref="Exception.InnerException"/> for more details.</exception>
         /// <exception cref="OperationCanceledException">The asynchronous operation was cancelled or timed out before
@@ -3033,7 +3310,7 @@ namespace NATS.Client
         public Task<Msg> RequestAsync(string subject, byte[] data)
         {
             int count = data != null ? data.Length : 0;
-            return requestAsync(subject, data, 0, count, Timeout.Infinite, CancellationToken.None);
+            return requestAsync(subject, null, data, 0, count, Timeout.Infinite, CancellationToken.None);
         }
 
         /// <summary>
@@ -3058,7 +3335,7 @@ namespace NATS.Client
         /// <seealso cref="IConnection.Request(string, byte[])"/>
         public Task<Msg> RequestAsync(string subject, byte[] data, int offset, int count)
         {
-            return requestAsync(subject, data, offset, count, Timeout.Infinite, CancellationToken.None);
+            return requestAsync(subject, null, data, offset, count, Timeout.Infinite, CancellationToken.None);
         }
 
         /// <summary>
@@ -3090,6 +3367,7 @@ namespace NATS.Client
         /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
         /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the
         /// response.</exception>
+        /// <exception cref="NATSNoRespondersException">No responders are available for this request.</exception>
         /// <exception cref="NATSException">There was an unexpected exception performing an internal NATS call while
         /// executing the request. See <see cref="Exception.InnerException"/> for more details.</exception>
         /// <exception cref="OperationCanceledException">The asynchronous operation was cancelled or timed out before
@@ -3098,7 +3376,7 @@ namespace NATS.Client
         public Task<Msg> RequestAsync(string subject, byte[] data, int timeout, CancellationToken token)
         {
             int count = data != null ? data.Length : 0;
-            return requestAsync(subject, data, 0, count, timeout, token);
+            return requestAsync(subject, null, data, 0, count, timeout, token);
         }
 
         /// <summary>
@@ -3126,6 +3404,7 @@ namespace NATS.Client
         /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
         /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the 
         /// response.</exception>
+        /// <exception cref="NATSNoRespondersException">No responders are available for this request.</exception>
         /// <exception cref="NATSException">There was an unexpected exception performing an internal NATS call while 
         /// executing the request. See <see cref="Exception.InnerException"/> for more details.</exception>
         /// <exception cref="OperationCanceledException">The asynchronous operation was cancelled or timed out before it
@@ -3134,7 +3413,7 @@ namespace NATS.Client
         public Task<Msg> RequestAsync(string subject, byte[] data, CancellationToken token)
         {
             int count = data != null ? data.Length : 0;
-            return requestAsync(subject, data, 0, count, Timeout.Infinite, token);
+            return requestAsync(subject, null, data, 0, count, Timeout.Infinite, token);
         }
 
         /// <summary>
@@ -3161,7 +3440,182 @@ namespace NATS.Client
         /// <seealso cref="IConnection.Request(string, byte[])"/>
         public Task<Msg> RequestAsync(string subject, byte[] data, int offset, int count, CancellationToken token)
         {
-            return requestAsync(subject, data, offset, count, Timeout.Infinite, token);
+            return requestAsync(subject, null, data, offset, count, Timeout.Infinite, token);
+        }
+
+        /// <summary>
+        /// Asynchronously sends a request message and returns the response <see cref="Msg"/>, or throws 
+        /// <see cref="NATSTimeoutException"/> if the <paramref name="timeout"/> expires.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="RequestAsync(Msg, int)"/> will create an unique inbox for this request, sharing a
+        /// single subscription for all replies to this <see cref="Connection"/> instance. However, if
+        /// <see cref="Options.UseOldRequestStyle"/> is set, each request will have its own underlying subscription.
+        /// The old behavior is not recommended as it may cause unnecessary overhead on connected NATS servers.
+        /// </remarks>
+        /// <param name="message">A NATS <see cref="Msg"/> that contains the request data to publish
+        /// to the connected NATS server.</param>
+        /// <param name="timeout">The number of milliseconds to wait.</param>
+        /// <returns>A task that represents the asynchronous read operation. The value of the <see cref="Task{TResult}.Result"/>
+        /// parameter contains a <see cref="Msg"/> with the response from the NATS server.</returns>
+        /// <exception cref="ArgumentException"><paramref name="timeout"/> is less than or equal to zero 
+        /// (<c>0</c>).</exception>
+        /// <exception cref="ArgumentNullException"><paramref name="message"/> is null.</exception>
+        /// <exception cref="NATSBadSubscriptionException">The <paramref name="message"/> subject is <c>null</c>
+        /// or entirely whitespace.</exception>
+        /// <exception cref="NATSMaxPayloadException"><paramref name="message"/> payload exceeds the maximum payload size
+        /// supported by the NATS server.</exception>
+        /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
+        /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the
+        /// response.</exception>
+        /// <exception cref="NATSNoRespondersException">No responders are available for this request.</exception>
+        /// <exception cref="NATSException">There was an unexpected exception performing an internal NATS call
+        /// while executing the request. See <see cref="Exception.InnerException"/> for more details.</exception>
+        /// <exception cref="OperationCanceledException">The asynchronous operation was cancelled or timed out before
+        /// it could be completed.</exception>
+        /// <exception cref="IOException">There was a failure while writing to the network.</exception>
+        public Task<Msg> RequestAsync(Msg message, int timeout)
+        {
+            if (message == null)
+            {
+                throw new ArgumentNullException("message");
+            }
+
+            byte[] headerBytes = message.header?.ToByteArray();
+            byte[] data = message.Data;
+            int count = data != null ? data.Length : 0;
+            return requestAsync(message.Subject, headerBytes, data, 0, count, timeout, CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Asynchronously sends a request message and returns the response <see cref="Msg"/>.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="RequestAsync(Msg)"/> will create an unique inbox for this request, sharing a single
+        /// subscription for all replies to this <see cref="Connection"/> instance. However, if
+        /// <see cref="Options.UseOldRequestStyle"/> is set, each request will have its own underlying subscription. 
+        /// The old behavior is not recommended as it may cause unnecessary overhead on connected NATS servers.
+        /// </remarks>
+        /// <param name="message">A NATS <see cref="Msg"/> that contains the request data to publish
+        /// to the connected NATS server.</param>
+        /// <returns>A task that represents the asynchronous read operation. The value of the 
+        /// <see cref="Task{TResult}.Result"/> parameter contains a <see cref="Msg"/> with the response from the NATS
+        /// server.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="message"/> is null.</exception>
+        /// <exception cref="NATSBadSubscriptionException">The <paramref name="message"/> subject is <c>null</c>
+        /// or entirely whitespace.</exception>
+        /// <exception cref="NATSMaxPayloadException"><paramref name="message"/> payload exceeds the maximum payload size 
+        /// supported by the NATS server.</exception>
+        /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
+        /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the
+        /// response.</exception>
+        /// <exception cref="NATSNoRespondersException">No responders are available for this request.</exception>
+        /// <exception cref="NATSException">There was an unexpected exception performing an internal NATS call while
+        /// executing the request. See <see cref="Exception.InnerException"/> for more details.</exception>
+        /// <exception cref="OperationCanceledException">The asynchronous operation was cancelled or timed out before
+        /// it could be completed.</exception>
+        /// <exception cref="IOException">There was a failure while writing to the network.</exception>
+        public Task<Msg> RequestAsync(Msg message)
+        {
+            if (message == null)
+            {
+                throw new ArgumentNullException("message");
+            }
+
+            byte[] headerBytes = message.header?.ToByteArray();
+            byte[] data = message.Data;
+            int count = data != null ? data.Length : 0;
+            return requestAsync(message.Subject, headerBytes, data, 0, count, Timeout.Infinite, CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Asynchronously sends a request message and returns the response <see cref="Msg"/>, or throws
+        /// <see cref="NATSTimeoutException"/> if the <paramref name="timeout"/> expires, while monitoring for 
+        /// cancellation requests.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="RequestAsync(Msg, int, CancellationToken)"/> will create an unique inbox for this
+        /// request, sharing a single subscription for all replies to this <see cref="Connection"/> instance. However,
+        /// if <see cref="Options.UseOldRequestStyle"/> is set, each request will have its own underlying subscription.
+        /// The old behavior is not recommended as it may cause unnecessary overhead on connected NATS servers.
+        /// </remarks>
+        /// <param name="message">A NATS <see cref="Msg"/> that contains the request data to publish
+        /// to the connected NATS server.</param>
+        /// <param name="timeout">The number of milliseconds to wait.</param>
+        /// <param name="token">The token to monitor for cancellation requests.</param>
+        /// <returns>A task that represents the asynchronous read operation. The value of the
+        /// <see cref="Task{TResult}.Result"/> parameter contains  a <see cref="Msg"/> with the response from the NATS
+        /// server.</returns>
+        /// <exception cref="ArgumentException"><paramref name="timeout"/> is less than or equal to zero
+        /// (<c>0</c>).</exception>
+        /// <exception cref="ArgumentNullException"><paramref name="message"/> is null.</exception>
+        /// <exception cref="NATSBadSubscriptionException">The <paramref name="message"/> subject is <c>null</c>
+        /// or entirely whitespace.</exception>
+        /// <exception cref="NATSMaxPayloadException"><paramref name="message"/> payload exceeds the maximum payload size
+        /// supported by the NATS server.</exception>
+        /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
+        /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the
+        /// response.</exception>
+        /// <exception cref="NATSNoRespondersException">No responders are available for this request.</exception>
+        /// <exception cref="NATSException">There was an unexpected exception performing an internal NATS call while
+        /// executing the request. See <see cref="Exception.InnerException"/> for more details.</exception>
+        /// <exception cref="OperationCanceledException">The asynchronous operation was cancelled or timed out before
+        /// it could be completed.</exception>
+        /// <exception cref="IOException">There was a failure while writing to the network.</exception>
+        public Task<Msg> RequestAsync(Msg message, int timeout, CancellationToken token)
+        {
+            if (message == null)
+            {
+                throw new ArgumentNullException("message");
+            }
+
+            byte[] headerBytes = message.header?.ToByteArray();
+            byte[] data = message.Data;
+            int count = data != null ? data.Length : 0;
+            return requestAsync(message.Subject, headerBytes, data, 0, count, timeout, token);
+        }
+
+        /// <summary>
+        /// Asynchronously sends a request message and returns the response <see cref="Msg"/>, while monitoring for
+        /// cancellation requests.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="RequestAsync(Msg, CancellationToken)"/> will create an unique inbox for this request,
+        /// sharing a single subscription for all replies to this <see cref="Connection"/> instance. However, if 
+        /// <see cref="Options.UseOldRequestStyle"/> is set, each request will have its own underlying subscription.
+        /// The old behavior is not recommended as it may cause unnecessary overhead on connected NATS servers.
+        /// </remarks>
+        /// <param name="message">A NATS <see cref="Msg"/> that contains the request data to publish
+        /// to the connected NATS server.</param>
+        /// <param name="token">The token to monitor for cancellation requests.</param>
+        /// <returns>A task that represents the asynchronous read operation. The value of the
+        /// <see cref="Task{TResult}.Result"/> parameter contains a <see cref="Msg"/> with the response from the NATS 
+        /// server.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="message"/> is null.</exception>
+        /// <exception cref="NATSBadSubscriptionException">The <paramref name="message"/> subject is <c>null</c>
+        /// or entirely whitespace.</exception>
+        /// <exception cref="NATSMaxPayloadException"><paramref name="message"/> payload exceeds the maximum payload size
+        /// supported by the NATS server.</exception>
+        /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
+        /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the 
+        /// response.</exception>
+        /// <exception cref="NATSNoRespondersException">No responders are available for this request.</exception>
+        /// <exception cref="NATSException">There was an unexpected exception performing an internal NATS call while 
+        /// executing the request. See <see cref="Exception.InnerException"/> for more details.</exception>
+        /// <exception cref="OperationCanceledException">The asynchronous operation was cancelled or timed out before it
+        /// could be completed.</exception>
+        /// <exception cref="IOException">There was a failure while writing to the network.</exception>
+        public Task<Msg> RequestAsync(Msg message, CancellationToken token)
+        {
+            if (message == null)
+            {
+                throw new ArgumentNullException("message");
+            }
+
+            byte[] headerBytes = message.header?.ToByteArray();
+            byte[] data = message.Data;
+            int count = data != null ? data.Length : 0;
+            return requestAsync(message.Subject, headerBytes, data, 0, count, Timeout.Infinite, token);
         }
 
         /// <summary>
@@ -3174,21 +3628,8 @@ namespace NATS.Client
         /// <returns>A unique inbox string.</returns>
         public string NewInbox()
         {
-            if (!opts.UseOldRequestStyle)
-            {
-                return IC.inboxPrefix + Guid.NewGuid().ToString("N");
-            }
-            else
-            {
-                if (r == null)
-                    r = new Random(Guid.NewGuid().GetHashCode());
-
-                byte[] buf = new byte[13];
-
-                r.NextBytes(buf);
-
-                return IC.inboxPrefix + BitConverter.ToString(buf).Replace("-","");
-            }
+            var prefix = opts.customInboxPrefix ?? IC.inboxPrefix;
+            return prefix + _nuid.GetNext();
         }
 
         internal void sendSubscriptionMessage(AsyncSubscription s)
@@ -3199,7 +3640,7 @@ namespace NATS.Client
                 // so that we can suppress here.
                 if (!isReconnecting())
                 {
-                    writeString(IC.subProto, s.Subject, s.Queue, s.sid);
+                    writeString(IC.subProto, s.Subject, s.Queue, s.sid.ToNumericString());
                     kickFlusher();
                 }
             }
@@ -3302,7 +3743,7 @@ namespace NATS.Client
                 // so that we can suppress here.
                 if (!isReconnecting())
                 {
-                    writeString(IC.subProto, subject, queue, s.sid);
+                    writeString(IC.subProto, subject, queue, s.sid.ToNumericString());
                 }
             }
 
@@ -3433,19 +3874,15 @@ namespace NATS.Client
         // Use Subscription.Unsubscribe()
         internal Task unsubscribe(Subscription sub, int max, bool drain, int timeout)
         {
-            Task task = null;
+            var task = CompletedTask.Get();
+            
             lock (mu)
             {
                 if (isClosed())
                     throw new NATSConnectionClosedException();
 
-                Subscription s;
-                if (!subs.TryGetValue(sub.sid, out s)
-                    || s == null)
-                {
-                    // already unsubscribed
-                    return null;
-                }
+                if (!subs.TryGetValue(sub.sid, out var s) || s == null)
+                    return task;
 
                 if (max > 0)
                 {
@@ -3464,7 +3901,7 @@ namespace NATS.Client
                 // We will send all subscriptions when reconnecting
                 // so that we can supress here.
                 if (!isReconnecting())
-                    writeString(IC.unsubProto, s.sid, max);
+                    writeString(IC.unsubProto, s.sid.ToNumericString(), max.ToNumericString());
 
             }
 
@@ -3473,11 +3910,18 @@ namespace NATS.Client
             return task;
         }
 
+        internal void removeSubSafe(Subscription s)
+        {
+            lock (mu)
+            {
+                removeSub(s);
+            }
+        }
+
+        // caller must lock
         internal virtual void removeSub(Subscription s)
         {
-            Subscription o;
-
-            subs.TryRemove(s.sid, out o);
+            subs.Remove(s.sid);
             if (s.mch != null)
             {
                 if (s.ownsChannel)
@@ -3495,14 +3939,10 @@ namespace NATS.Client
         // call outstanding and we call close.
         private bool removeFlushEntry(SingleUseChannel<bool> chan)
         {
-            if (pongs == null)
+            if (!pongs.TryDequeue(out var start))
                 return false;
 
-            if (pongs.Count == 0)
-                return false;
-
-            SingleUseChannel<bool> start = pongs.Dequeue();
-            SingleUseChannel<bool> c = start;
+            var c = start;
 
             while (true)
             {
@@ -3511,12 +3951,11 @@ namespace NATS.Client
                     SingleUseChannel<bool>.Return(c);
                     return true;
                 }
-                else
-                {
-                    pongs.Enqueue(c);
-                }
 
-                c = pongs.Dequeue();
+                pongs.Enqueue(c);
+
+                if (!pongs.TryDequeue(out c))
+                    return false;
 
                 if (c == start)
                     break;
@@ -3616,6 +4055,24 @@ namespace NATS.Client
             Flush(DEFAULT_FLUSH_TIMEOUT);
         }
 
+        /// <summary>
+        /// Immediately flushes the underlying connection buffer if the connection is valid.
+        /// </summary>
+        /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
+        /// <exception cref="NATSException">There was an unexpected exception performing an internal NATS call while executing the
+        /// request. See <see cref="Exception.InnerException"/> for more details.</exception>
+        public void FlushBuffer()
+        {
+            lock (mu)
+            {
+                if (isClosed())
+                    throw new NATSConnectionClosedException();
+
+                if (status == ConnState.CONNECTED)
+                    bw.Flush();
+            }
+        }
+
         // resendSubscriptions will send our subscription state back to the
         // server. Used in reconnects
         private void resendSubscriptions()
@@ -3625,7 +4082,7 @@ namespace NATS.Client
                 if (s is IAsyncSubscription)
                     ((AsyncSubscription)s).enableAsyncProcessing();
 
-                writeString(IC.subProto, s.Subject, s.Queue, s.sid);
+                writeString(IC.subProto, s.Subject, s.Queue, s.sid.ToNumericString());
             }
 
             bw.Flush();
@@ -3635,14 +4092,8 @@ namespace NATS.Client
         // Lock must be held by the caller.
         private void clearPendingFlushCalls()
         {
-
-            // Clear any queued pongs, e.g. pending flush calls.
-            foreach (SingleUseChannel<bool> ch in pongs)
-            {
-                if (ch != null)
-                    ch.add(true);
-            }
-            pongs.Clear();
+            while(pongs.TryDequeue(out var ch))
+                ch?.add(true);
         }
 
 
@@ -3650,12 +4101,14 @@ namespace NATS.Client
         // Caller must lock
         private void clearPendingRequestCalls()
         {
-            foreach (var request in waitingRequests)
+            lock (mu)
             {
-                request.Value.Waiter.TrySetCanceled();
+                foreach (var request in waitingRequests)
+                {
+                    request.Value.Waiter.TrySetCanceled();
+                }
+                waitingRequests.Clear();
             }
-
-            waitingRequests.Clear();
         }
 
 
@@ -3663,7 +4116,7 @@ namespace NATS.Client
         // desired status. Also controls whether user defined callbacks
         // will be triggered. The lock should not be held entering this
         // function. This function will handle the locking manually.
-        private void close(ConnState closeState, bool invokeDelegates)
+        private void close(ConnState closeState, bool invokeDelegates, Exception error = null)
         {
             lock (mu)
             {
@@ -3705,7 +4158,7 @@ namespace NATS.Client
                 // disconnect;
                 if (invokeDelegates && conn.isSetup())
                 {
-                    scheduleConnEvent(Opts.DisconnectedEventHandler);
+                    scheduleConnEvent(Opts.DisconnectedEventHandler, error);
                 }
 
                 // Go ahead and make sure we have flushed the outbound buffer.
@@ -3724,7 +4177,30 @@ namespace NATS.Client
                         {
                             bw.Dispose();
                         }
-                        catch (Exception) { /* ignore */ }
+                        catch (Exception)
+                        {
+                            /* ignore */
+                        }
+                        finally
+                        {
+                            bw = null;
+                        }
+                    }
+
+                    if (br != null)
+                    {
+                        try
+                        {
+                            br.Dispose();
+                        }
+                        catch
+                        {
+                            // ignored
+                        }
+                        finally
+                        {
+                            br = null;
+                        }
                     }
 
                     conn.teardown();
@@ -3732,7 +4208,7 @@ namespace NATS.Client
 
                 if (invokeDelegates)
                 {
-                    scheduleConnEvent(opts.ClosedEventHandler);
+                    scheduleConnEvent(opts.ClosedEventHandler, error);
                 }
 
                 status = closeState;
@@ -3747,12 +4223,12 @@ namespace NATS.Client
         /// <seealso cref="State"/>
         public void Close()
         {
-            close(ConnState.CLOSED, true);
+            close(ConnState.CLOSED, true, lastEx);
             callbackScheduler.ScheduleStop();
             disableSubChannelPooling();
         }
 
-        // assume the lock is head.
+        // assume the lock is held.
         private bool isClosed()
         {
             return (status == ConnState.CLOSED);
@@ -3845,6 +4321,13 @@ namespace NATS.Client
 
             lock (mu)
             {
+                if (isClosed())
+                    throw new NATSConnectionClosedException();
+
+                // if we're already draining, exit.
+                if (isDrainingSubs() || isDrainingPubs())
+                    return;
+
                 lsubs = subs.Values;
                 status = ConnState.DRAINING_SUBS;
             }
@@ -3908,15 +4391,7 @@ namespace NATS.Client
         /// <seealso cref="Close()"/>
         public void Drain()
         {
-            var t = DrainAsync();
-            try
-            {
-                t.Wait();
-            }
-            catch (AggregateException)
-            {
-                throw new NATSTimeoutException();
-            }
+            Drain(Defaults.DefaultDrainTimeout);
         }
 
         /// <summary>
@@ -3934,15 +4409,10 @@ namespace NATS.Client
         /// <param name="timeout">The duration to wait before draining.</param> 
         public void Drain(int timeout)
         {
-            var t = DrainAsync(timeout);
-            try
-            {
-                t.Wait();
-            }
-            catch (AggregateException)
-            {
-                throw new NATSTimeoutException();
-            }
+            if (timeout <= 0)
+                throw new ArgumentOutOfRangeException(nameof(timeout), "Timeout must be greater than zero.");
+
+            drain(timeout);
         }
 
         /// <summary>
@@ -3981,11 +4451,6 @@ namespace NATS.Client
         {
             if (timeout <= 0)
                 throw new ArgumentOutOfRangeException(nameof(timeout), "Timeout must be greater than zero.");
-
-            lock (mu)
-            {
-                status = ConnState.DRAINING_SUBS;
-            }
 
             return Task.Run(() => drain(timeout));
         }
@@ -4113,7 +4578,7 @@ namespace NATS.Client
             {
                 lock (mu)
                 {
-                    return info.maxPayload;
+                    return info.max_payload;
                 }
             }
         }

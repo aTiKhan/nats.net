@@ -14,7 +14,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-#if NET45
+#if NET46
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Formatters.Binary;
 #endif
@@ -110,11 +110,11 @@ namespace NATS.Client
             onDeserialize = defaultDeserializer;
         }
 
-#if NET45
+#if NET46
         private IFormatter f = new BinaryFormatter();
 
         // Note, the connection locks around this, so while we are using a
-        // byte array in the connection, we are still threadsafe.
+        // byte array in the connection, we are still thread safe.
         internal byte[] defaultSerializer(Object obj)
         {
             byte[] rv = null;
@@ -143,7 +143,7 @@ namespace NATS.Client
         // it'd be nice to have a default serializer per subscription to avoid
         // the lock here, but this  mirrors go.
         //
-        // TODO:  Look at moving the default to the wrapper and keeping a derialization
+        // TODO:  Look at moving the default to the wrapper and keeping a deserialization
         // stream there.
         internal object defaultDeserializer(byte[] data)
         {
@@ -171,7 +171,7 @@ namespace NATS.Client
 
             byte[] data = onSerialize(o);
             int count = data != null ? data.Length : 0;
-            publish(subject, reply, data, 0, count);
+            publish(subject, reply, null, data, 0, count, false);
         }
 
         /// <summary>
@@ -182,7 +182,7 @@ namespace NATS.Client
         /// <param name="obj">The <see cref="Object"/> to serialize and publish to the connected NATS server.</param>
         /// <exception cref="NATSBadSubscriptionException"><paramref name="subject"/> is 
         /// <c>null</c> or entirely whitespace.</exception>
-        /// <exception cref="NATSMaxPayloadException">The serialzed form of <paramref name="obj"/> exceeds the maximum payload size 
+        /// <exception cref="NATSMaxPayloadException">The serialized form of <paramref name="obj"/> exceeds the maximum payload size 
         /// supported by the NATS server.</exception>
         /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
         /// <exception cref="NATSException"><para><see cref="OnSerialize"/> is <c>null</c>.</para>
@@ -204,7 +204,7 @@ namespace NATS.Client
         /// <param name="obj">The <see cref="Object"/> to serialize and publish to the connected NATS server.</param>
         /// <exception cref="NATSBadSubscriptionException"><paramref name="subject"/> is <c>null</c> or
         /// entirely whitespace.</exception>
-        /// <exception cref="NATSMaxPayloadException">The serialzed form of <paramref name="obj"/> exceeds the maximum payload size 
+        /// <exception cref="NATSMaxPayloadException">The serialized form of <paramref name="obj"/> exceeds the maximum payload size 
         /// supported by the NATS server.</exception>
         /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
         /// <exception cref="NATSException"><para><see cref="OnSerialize"/> is <c>null</c>.</para>
@@ -336,7 +336,7 @@ namespace NATS.Client
         {
             byte[] data = onSerialize(obj);
             int count = data != null ? data.Length : 0;
-            Msg m = base.request(subject, data, 0, count, timeout);
+            Msg m = base.request(subject, null, data, 0, count, timeout);
             return onDeserialize(m.Data);
         }
 
@@ -359,7 +359,7 @@ namespace NATS.Client
         /// (<c>0</c>).</exception>
         /// <exception cref="NATSBadSubscriptionException"><paramref name="subject"/> is <c>null</c> or
         /// entirely whitespace.</exception>
-        /// <exception cref="NATSMaxPayloadException">The serialzed form of <paramref name="obj"/> exceeds the maximum payload size 
+        /// <exception cref="NATSMaxPayloadException">The serialized form of <paramref name="obj"/> exceeds the maximum payload size 
         /// supported by the NATS server.</exception>
         /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
         /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the 
@@ -387,7 +387,7 @@ namespace NATS.Client
         /// <returns>A <see cref="Object"/> with the deserialized response from the NATS server.</returns>
         /// <exception cref="NATSBadSubscriptionException"><paramref name="subject"/> is <c>null</c> or 
         /// entirely whitespace.</exception>
-        /// <exception cref="NATSMaxPayloadException">The serialzed form of <paramref name="obj"/> exceeds the maximum payload size 
+        /// <exception cref="NATSMaxPayloadException">The serialized form of <paramref name="obj"/> exceeds the maximum payload size 
         /// supported by the NATS server.</exception>
         /// <exception cref="NATSConnectionClosedException">The <see cref="Connection"/> is closed.</exception>
         /// <exception cref="NATSTimeoutException">A timeout occurred while sending the request or receiving the

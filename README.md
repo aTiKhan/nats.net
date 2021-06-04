@@ -1,17 +1,17 @@
 
 # NATS - .NET C# Client
 
-A [C# .NET](https://msdn.microsoft.com/en-us/vstudio/aa496123.aspx) client for the [NATS messaging system](https://nats.io) multi targetting `.NET4.5+` and `.NETStandard1.6`.
+A [C# .NET](https://msdn.microsoft.com/en-us/vstudio/aa496123.aspx) client for the [NATS messaging system](https://nats.io) multi targetting `.NET4.6+` and `.NETStandard1.6`.
 
 This NATS Maintainer supported client parallels the [NATS GO Client](https://github.com/nats-io/nats).
 
 [![License Apache 2.0](https://img.shields.io/badge/License-Apache2-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![API Documentation](https://img.shields.io/badge/doc-Doxygen-brightgreen.svg?style=flat)](http://nats-io.github.io/nats.net)
-[![Build Status](https://dev.azure.com/NATS-CI/NATS-CI/_apis/build/status/nats-io.nats.net?branchName=master)](https://dev.azure.com/NATS-CI/NATS-CI/_build/latest?definitionId=2&branchName=master)
-[![NuGet](https://img.shields.io/nuget/v/NATS.Client.svg?maxAge=2592000)](https://www.nuget.org/packages/NATS.Client)
+[![Build Status](https://dev.azure.com/NATS-CI/NATS-CI/_apis/build/status/nats-io.nats.net-CI?branchName=master)](https://dev.azure.com/NATS-CI/NATS-CI/_build/latest?definitionId=2&branchName=master)
+[![NuGet](https://img.shields.io/nuget/v/NATS.Client.svg?cacheSeconds=3600)](https://www.nuget.org/packages/NATS.Client)
 
 ## Getting started
-The easiest and recommended way to start using NATS in you .NET projects, is to use the [NuGet package]((https://www.nuget.org/packages/NATS.Client)). For examples on how to use the client, see below or in any of the included sample projects.
+The easiest and recommended way to start using NATS in your .NET projects, is to use the [NuGet package]((https://www.nuget.org/packages/NATS.Client)). For examples on how to use the client, see below or in any of the included sample projects.
 
 ## Get up and running with the source code
 First, download the source code:
@@ -40,7 +40,7 @@ The repository contains several projects, all located under `src\`
 All examples provide statistics for benchmarking.
 
 ### .NET Core SDK
-.NET Core SDK style projects are used, so ensure your environment (command line, VSCode, Visual Studio, etc) supports the targetted .NET Core SDK in `src\global.json` as well as .NET Framework 4.5.1 or greater.
+.NET Core SDK style projects are used, so ensure your environment (command line, VSCode, Visual Studio, etc) supports the targetted .NET Core SDK in `src\global.json` as well as .NET Framework 4.6 or greater.
 
 ### Visual Studio
 The recommendation is to load `src\NATS.sln` into Visual Studio 2019 (Visual Studio 2017 works as well). .NET Core SDK style projects are used to multitarget different frameworks, so when working with the source code (debugging, running tets etc) you might need to mind the "context" of the current framework.
@@ -164,11 +164,73 @@ Here are example snippets of using the API to create a connection, subscribe, pu
             c.Close();
 ```
 
+## RX Usage
+Importing the namespace `NATS.Client.Rx` you will be able to use an extension method
+`connection.Observe(subject)` to turn the connection to an observable. If you have a more
+advanced `IAsyncSubscription`, you can use `asyncSubscription.ToObservable()`.
+
+You can now import the namespace `NATS.Client.Rx.Ops`. After this you get builtin support for:
+- Subscribe
+- SubscribeSafe (will not fail an observer if it misbehaves)
+- Where
+- Select
+
+If you want, you could instead take an external dependency on `System.Reactive` and use that
+instead of `NATS.RX.Ops`.
+
+```csharp
+using System;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using NATS.Client;
+using NATS.Client.Rx;
+using NATS.Client.Rx.Ops; //Can be replaced with using System.Reactive.Linq;
+
+namespace RxSample
+{
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            using (var cn = new ConnectionFactory().CreateConnection())
+            {
+                var temperatures =
+                    cn.Observe("temperatures")
+                        .Where(m => m.Data?.Any() == true)
+                        .Select(m => BitConverter.ToInt32(m.Data, 0));
+
+                temperatures.Subscribe(t => Console.WriteLine($"{t}C"));
+
+                temperatures.Subscribe(t => Console.WriteLine($"{(t * 9 / 5) + 32}F"));
+
+                var cts = new CancellationTokenSource();
+
+                Task.Run(async () =>
+                {
+                    var rnd = new Random();
+
+                    while (!cts.IsCancellationRequested)
+                    {
+                        cn.Publish("temperatures", BitConverter.GetBytes(rnd.Next(-10, 40)));
+
+                        await Task.Delay(1000, cts.Token);
+                    }
+                }, cts.Token);
+
+                Console.ReadKey();
+                cts.Cancel();
+            }
+        }
+    }
+}
+```
+
 ## Basic Encoded Usage
 The .NET NATS client mirrors go encoding through serialization and
 deserialization.  Simply create an encoded connection and publish
 objects, and receive objects through an asynchronous subscription using
-the encoded message event handler.  The .NET 4.5 client has a default formatter
+the encoded message event handler.  The .NET 4.6 client has a default formatter
 serializing objects using the BinaryFormatter, but methods used to serialize and deserialize
 objects can be overridden.  The NATS core version does not have serialization
 defaults and they must be specified.
@@ -203,7 +265,7 @@ defaults and they must be specified.
 ### Other Types of Serialization
 Optionally, one can override serialization.  Depending on the level of support or
 third party packages used, objects can be serialized to JSON, SOAP, or a custom
-scheme.  XML was chosen as the example here as it is natively supported by .NET 4.5.
+scheme.  XML was chosen as the example here as it is natively supported by .NET 4.6.
 
 ```C#
         // Example XML serialization.
@@ -478,7 +540,6 @@ The NATS .NET client supports the cluster discovery protocol.  The list of serve
             Options opts = ConnectionFactory.GetDefaultOptions();
             opts.MaxReconnect = 2;
             opts.ReconnectWait = 1000;
-            opts.NoRandomize = true;
             opts.Servers = servers;
 
             IConnection c = new ConnectionFactory().CreateConnection(opts);
@@ -539,7 +600,7 @@ The NATS server default cipher suites **may not be supported** by the Microsoft
 the  NATS server to include the most secure cipher suites supported by the
 .NET framework.
 
-## New Authentication (Nkeys and User Credentials)
+## NATS 2.0 Authentication (Nkeys and User Credentials)
 
 This requires server with version >= 2.0.0
 
@@ -557,7 +618,7 @@ and wipe and erase memory it uses for each connect or reconnect.
 The helper also can take two entries, one for the JWT and one for the NKey seed file.
 
 ```C#
-IConnection c = new ConnectionFactory().CreateConnection("nats://127.0.0.1", "user.creds", "user.nk"
+IConnection c = new ConnectionFactory().CreateConnection("nats://127.0.0.1", "user.jwt", "user.nk");
 ```
 
 You can also set the event handlers directly and manage challenge signing directly.
@@ -609,6 +670,32 @@ opts.SetNkey("UCKKTOZV72L3NITTGNOCRDZUI5H632XCT4ZWPJBC2X3VEY72KJUWEZ2Z",
 
 // Direct
 IConnection c = new ConnectionFactory().CreateConnection(opts));
+```
+
+## Message Headers
+
+The NATS.Client version 0.11.0 and NATS server version 2.2 support message headers.
+Message headers are represented as a string name value pair just as HTTP headers are.
+
+### Setting Message Headers
+
+```C#
+IConnection c = new new ConnectionFactory().CreateConnection();
+
+Msg m = new Msg();
+m.Header["Content-Type"] = "json";
+m.Subject = "foo";
+c.Publish(m);
+```
+
+### Getting Message Headers
+
+```C#
+IConnection c = new new ConnectionFactory().CreateConnection();
+var s = c.SubscribeSync("foo")
+
+Msg m = s.NextMessage();
+string contentType = m.Header["Content-Type"];
 ```
 
 ## Exceptions

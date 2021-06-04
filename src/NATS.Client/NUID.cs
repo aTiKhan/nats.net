@@ -22,6 +22,7 @@ namespace NATS.Client
     /// that is started at a pseudo random number and increments with a pseudo-random increment.
     /// Total is 22 bytes of base 36 ascii text.
     /// </summary>
+    [Obsolete("NATS.Client.NUID is deprecated and will be removed in a future version")]
     public class NUID
     {
         private static char[] digits = 
@@ -52,7 +53,7 @@ namespace NATS.Client
         private static int  minInc = 33;
         private static int  maxInc = 333;
         private static long totalLen = preLen + seqLen;
-#if NET45
+#if NET46
         private RNGCryptoServiceProvider srand = new RNGCryptoServiceProvider();
 #else
         private RandomNumberGenerator srand = RandomNumberGenerator.Create();

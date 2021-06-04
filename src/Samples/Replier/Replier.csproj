@@ -2,7 +2,6 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFrameworks>netcoreapp2.2;net45</TargetFrameworks>
     <Title>NATS Replier</Title>
     <Description>NATS Replier Example</Description>
     <IsPackable>false</IsPackable>

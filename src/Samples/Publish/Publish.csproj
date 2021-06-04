@@ -2,7 +2,6 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFrameworks>netcoreapp2.2;net45</TargetFrameworks>
     <Title>NATS Publisher</Title>
     <Description>NATS Publish Example</Description>
     <IsPackable>false</IsPackable>

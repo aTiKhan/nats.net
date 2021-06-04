@@ -12,6 +12,7 @@
 // limitations under the License.
 
 using System;
+using System.Reflection;
 
 /*! \mainpage %NATS .NET client.
  *
@@ -70,7 +71,7 @@ namespace NATS.Client
         /// <summary>
         /// Client version
         /// </summary>
-        public const string Version = "0.0.1";
+        public static readonly string Version = typeof(Defaults).GetTypeInfo().Assembly.GetName().Version.ToString();
 
         /// <summary>
         /// The default NATS connect url ("nats://localhost:4222")
@@ -137,12 +138,27 @@ namespace NATS.Client
         /// </summary>
         public const int DefaultDrainTimeout = 30000;
 
+        /// <summary>
+        /// Default Pending buffer size is 8 MB.
+        /// </summary>
+        public const int ReconnectBufferSize = 8 * 1024 * 1024; // 8MB
+
+        /// <summary>
+        /// Default non-TLS reconnect jitter of 100ms.
+        /// </summary>
+        public const int ReconnectJitter = 100;
+
+        /// <summary>
+        /// Default TLS reconnect jitter of 1s.
+        /// </summary>
+        public const int ReconnectJitterTLS = 1000;
+
         /*
          * Namespace level defaults
          */
 
         // Scratch storage for assembling protocol headers
-        internal const int scratchSize = 512;
+        internal const int MaxControlLineSize = 4096;
 
         // The size of the bufio writer on top of the socket.
         internal const int defaultBufSize = 32768;
@@ -163,21 +179,47 @@ namespace NATS.Client
     /// </summary>
     public class ConnEventArgs : EventArgs
     {
-        private Connection c;   
-            
-        internal ConnEventArgs(Connection c)
+        internal ConnEventArgs(Connection c, Exception error = null)
         {
-            this.c = c;
+            this.Conn = c;
+            this.Error = error;
         }
 
         /// <summary>
         /// Gets the <see cref="Connection"/> associated with the event.
         /// </summary>
-        public Connection Conn
-        {
-            get { return c; }
-        }
+        public Connection Conn { get; }
+
+        /// <summary>
+        /// Gets any Exception associated with the connection state change.
+        /// </summary>
+        /// <example>Could be an exception causing the connection to get disconnected.</example>
+        public Exception Error { get; }
     }
+
+    /// <summary>
+    /// Provides details for the ReconnectDelayEvent.
+    /// </summary>
+    /// <remarks>
+    /// This event handler is a good place to apply backoff logic.  The associated
+    /// connection will be RECONNECTING so accessing or calling IConnection methods will result
+    /// in undefined behavior (including deadlocks).  Assigning a non-default handler
+    /// requires the application to define reconnect delay and backoff behavior.
+    /// </remarks>
+    public class ReconnectDelayEventArgs : EventArgs
+    {
+        internal ReconnectDelayEventArgs(int attempts)
+        {
+            Attempts = attempts;
+        }
+
+        /// <Summary>
+        /// Gets the number of times the client has traversed the
+        /// server list in attempting to reconnect.
+        /// </Summary>
+        public int Attempts { get; }
+    }
+
 
     /// <summary>
     /// Provides details when a user JWT is read during a connection.  The
@@ -240,7 +282,7 @@ namespace NATS.Client
             {
                 if (signedNonce == null)
                 {
-                    throw new NATSConnectionException("SignedNonce was not set by the UserSignature event hander.");
+                    throw new NATSConnectionException("SignedNonce was not set by the UserSignature event handler.");
                 }
                 return signedNonce;
             }
@@ -298,6 +340,7 @@ namespace NATS.Client
         internal const string _EMPTY_ = "";
         internal const string _SPC_   = " ";
         internal const string _PUB_P_ = "PUB ";
+        internal const string _HPUB_P_ = "HPUB ";
 
         internal const string _OK_OP_   = "+OK";
         internal const string _ERR_OP_  = "-ERR";
@@ -308,7 +351,7 @@ namespace NATS.Client
 
         internal const string inboxPrefix = "_INBOX.";
 
-        internal const string conProto   = "CONNECT {0}" + IC._CRLF_;
+        internal const string conProtoNoCRLF   = "CONNECT";
         internal const string pingProto  = "PING" + IC._CRLF_;
         internal const string pongProto  = "PONG" + IC._CRLF_;
         internal const string pubProto   = "PUB {0} {1} {2}" + IC._CRLF_;

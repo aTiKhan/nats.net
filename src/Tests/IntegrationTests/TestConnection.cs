@@ -12,10 +12,13 @@
 // limitations under the License.
 
 using System;
+using System.Collections.Concurrent;
 using NATS.Client;
 using System.Threading;
 using Xunit;
 using System.Diagnostics;
+using System.Threading.Tasks;
+using System.Timers;
 
 namespace IntegrationTests
 {
@@ -28,10 +31,12 @@ namespace IntegrationTests
         {
             using (NATSServer.CreateFastAndVerify(Context.Server1.Port))
             {
-                IConnection c = Context.OpenConnection(Context.Server1.Port);
-                Assert.Equal(ConnState.CONNECTED, c.State);
-                c.Close();
-                Assert.Equal(ConnState.CLOSED, c.State);
+                using (var c = Context.OpenConnection(Context.Server1.Port))
+                {
+                    Assert.Equal(ConnState.CONNECTED, c.State);
+                    c.Close();
+                    Assert.Equal(ConnState.CLOSED, c.State);
+                }
             }
         }
 
@@ -46,13 +51,16 @@ namespace IntegrationTests
                 {
                     ev.Set();
                 };
-                IConnection c = Context.ConnectionFactory.CreateConnection(o);
-                c.Close();
-                Assert.True(ev.WaitOne(1000));
+                using (var c = Context.ConnectionFactory.CreateConnection(o))
+                {
+                    c.Close();
+                    Assert.True(ev.WaitOne(1000));
+                }
 
                 // now test using.
                 ev.Reset();
-                using (c = Context.ConnectionFactory.CreateConnection(o)) { };
+                using (var c = Context.ConnectionFactory.CreateConnection(o)) { }
+
                 Assert.True(ev.WaitOne(1000));
             }
         }
@@ -76,23 +84,107 @@ namespace IntegrationTests
                     }
                 };
 
-                IConnection c = Context.ConnectionFactory.CreateConnection(o);
-                lock (mu)
+                using (var c = Context.ConnectionFactory.CreateConnection(o))
                 {
-                    c.Close();
-                    Monitor.Wait(mu, 20000);
+                    lock (mu)
+                    {
+                        c.Close();
+                        Monitor.Wait(mu, 20000);
+                    }
+
+                    Assert.True(disconnected);
                 }
-                Assert.True(disconnected);
 
                 // now test using.
                 disconnected = false;
                 lock (mu)
                 {
-                    using (c = Context.ConnectionFactory.CreateConnection(o)) { };
+                    using (Context.ConnectionFactory.CreateConnection(o)) { }
                     Monitor.Wait(mu, 20000);
                 }
                 Assert.True(disconnected);
             }
+        }
+
+        [Fact]
+        public void TestErrorHandlerWhenNotAllowingReconnectErrorShouldBeProvided()
+        {
+            var closedEv = new AutoResetEvent(false);
+            var disconEv = new AutoResetEvent(false);
+            var opts = Context.GetTestOptions(Context.Server1.Port);
+            var errors = new ConcurrentQueue<Exception>();
+            opts.AllowReconnect = false;
+            opts.ClosedEventHandler = (sender, args) =>
+            {
+                if (args.Error != null)
+                    errors.Enqueue(args.Error);
+
+                closedEv.Set();
+            };
+            opts.DisconnectedEventHandler = (sender, args) =>
+            {
+                if (args.Error != null)
+                    errors.Enqueue(args.Error);
+
+                disconEv.Set();
+            };
+
+            using (var s = NATSServer.CreateFastAndVerify(Context.Server1.Port))
+            {
+                using (Context.ConnectionFactory.CreateConnection(opts))
+                {
+                    s.Bounce(1000);
+                }
+            }
+
+            Assert.True(closedEv.WaitOne(1000));
+            Assert.True(disconEv.WaitOne(1000));
+            Assert.Equal(2, errors.Count);
+        }
+
+        [Fact]
+        public void TestErrorHandlerWhenAllowingReconnectErrorShouldNotBeProvided()
+        {
+            var closedEv = new AutoResetEvent(false);
+            var disconEv = new AutoResetEvent(false);
+            var reconEv = new AutoResetEvent(false);
+            var opts = Context.GetTestOptions(Context.Server1.Port);
+            var errors = new ConcurrentQueue<Exception>();
+            opts.AllowReconnect = true;
+            opts.ClosedEventHandler = (sender, args) =>
+            {
+                if (args.Error != null)
+                    errors.Enqueue(args.Error);
+
+                closedEv.Set();
+            };
+            opts.DisconnectedEventHandler = (sender, args) =>
+            {
+                if (args.Error != null)
+                    errors.Enqueue(args.Error);
+
+                disconEv.Set();
+            };
+            opts.ReconnectedEventHandler = (sender, args) =>
+            {
+                if (args.Error != null)
+                    errors.Enqueue(args.Error);
+
+                reconEv.Set();
+            };
+
+            using (var s = NATSServer.CreateFastAndVerify(Context.Server1.Port))
+            {
+                using (Context.ConnectionFactory.CreateConnection(opts))
+                {
+                    s.Bounce(1000);
+                    Assert.True(disconEv.WaitOne(1000));
+                    Assert.True(reconEv.WaitOne(2000));
+                }
+                Assert.True(closedEv.WaitOne(1000));
+            }
+
+            Assert.Empty(errors);
         }
 
         [Fact]
@@ -109,12 +201,14 @@ namespace IntegrationTests
                     ev.Set();
                 };
 
-                IConnection c = Context.ConnectionFactory.CreateConnection(o);
-                s.Bounce(1000);
+                using (var c = Context.ConnectionFactory.CreateConnection(o))
+                {
+                    s.Bounce(1000);
 
-                Assert.True(ev.WaitOne(10000));
+                    Assert.True(ev.WaitOne(10000));
 
-                c.Close();
+                    c.Close();
+                }
             }
         }
 
@@ -123,34 +217,37 @@ namespace IntegrationTests
         {
             using (NATSServer.CreateFastAndVerify(Context.Server1.Port))
             {
-                IConnection c = Context.OpenConnection(Context.Server1.Port);
-                ISyncSubscription s = c.SubscribeSync("foo");
+                using (var c = Context.OpenConnection(Context.Server1.Port))
+                {
+                    using (var s = c.SubscribeSync("foo"))
+                    {
+                        c.Close();
 
-                c.Close();
+                        // While we can annotate all the exceptions in the test framework,
+                        // just do it manually.
+                        Assert.ThrowsAny<NATSConnectionClosedException>(() => c.Publish("foo", null));
 
-                // While we can annotate all the exceptions in the test framework,
-                // just do it manually.
-                Assert.ThrowsAny<NATSConnectionClosedException>(() => c.Publish("foo", null));
+                        Assert.ThrowsAny<NATSConnectionClosedException>(() => c.Publish(new Msg("foo")));
 
-                Assert.ThrowsAny<NATSConnectionClosedException>(() => c.Publish(new Msg("foo")));
+                        Assert.ThrowsAny<NATSConnectionClosedException>(() => c.SubscribeAsync("foo"));
 
-                Assert.ThrowsAny<NATSConnectionClosedException>(() => c.SubscribeAsync("foo"));
+                        Assert.ThrowsAny<NATSConnectionClosedException>(() => c.SubscribeSync("foo"));
 
-                Assert.ThrowsAny<NATSConnectionClosedException>(() => c.SubscribeSync("foo"));
+                        Assert.ThrowsAny<NATSConnectionClosedException>(() => c.SubscribeAsync("foo", "bar"));
 
-                Assert.ThrowsAny<NATSConnectionClosedException>(() => c.SubscribeAsync("foo", "bar"));
+                        Assert.ThrowsAny<NATSConnectionClosedException>(() => c.SubscribeSync("foo", "bar"));
 
-                Assert.ThrowsAny<NATSConnectionClosedException>(() => c.SubscribeSync("foo", "bar"));
+                        Assert.ThrowsAny<NATSConnectionClosedException>(() => c.Request("foo", null));
 
-                Assert.ThrowsAny<NATSConnectionClosedException>(() => c.Request("foo", null));
+                        Assert.ThrowsAny<NATSConnectionClosedException>(() => s.NextMessage());
 
-                Assert.ThrowsAny<NATSConnectionClosedException>(() => s.NextMessage());
+                        Assert.ThrowsAny<NATSConnectionClosedException>(() => s.NextMessage(100));
 
-                Assert.ThrowsAny<NATSConnectionClosedException>(() => s.NextMessage(100));
+                        Assert.ThrowsAny<NATSConnectionClosedException>(() => s.Unsubscribe());
 
-                Assert.ThrowsAny<NATSConnectionClosedException>(() => s.Unsubscribe());
-
-                Assert.ThrowsAny<NATSConnectionClosedException>(() => s.AutoUnsubscribe(1));
+                        Assert.ThrowsAny<NATSConnectionClosedException>(() => s.AutoUnsubscribe(1));
+                    }
+                }
             }
         }
 
@@ -162,8 +259,8 @@ namespace IntegrationTests
                 var o = Context.GetTestOptions(Context.Server1.Port);
                 o.Verbose = true;
 
-                IConnection c = Context.ConnectionFactory.CreateConnection(o);
-                c.Close();
+                using (var c = Context.ConnectionFactory.CreateConnection(o))
+                    c.Close();
             }
         }
 
@@ -181,8 +278,8 @@ namespace IntegrationTests
                     serverDiscoveredCalled = true;
                 };
 
-                IConnection c = Context.ConnectionFactory.CreateConnection(o);
-                c.Close();
+                using (var c = Context.ConnectionFactory.CreateConnection(o))
+                    c.Close();
 
                 Assert.False(serverDiscoveredCalled);
             }
@@ -205,12 +302,12 @@ namespace IntegrationTests
             long ctime = orig;
 
             AutoResetEvent reconnected = new AutoResetEvent(false);
-            AutoResetEvent closed      = new AutoResetEvent(false);
-            AutoResetEvent asyncErr1   = new AutoResetEvent(false);
-            AutoResetEvent asyncErr2   = new AutoResetEvent(false);
-            AutoResetEvent recvCh      = new AutoResetEvent(false);
-            AutoResetEvent recvCh1     = new AutoResetEvent(false);
-            AutoResetEvent recvCh2     = new AutoResetEvent(false);
+            AutoResetEvent closed = new AutoResetEvent(false);
+            AutoResetEvent asyncErr1 = new AutoResetEvent(false);
+            AutoResetEvent asyncErr2 = new AutoResetEvent(false);
+            AutoResetEvent recvCh = new AutoResetEvent(false);
+            AutoResetEvent recvCh1 = new AutoResetEvent(false);
+            AutoResetEvent recvCh2 = new AutoResetEvent(false);
 
             using (NATSServer
                    serverAuth = NATSServer.CreateWithConfig(Context.Server1.Port, "auth.conf"),
@@ -262,7 +359,7 @@ namespace IntegrationTests
 
                 o.ReconnectWait = 500;
                 o.NoRandomize = true;
-                o.Servers = new [] { Context.Server2.Url, Context.Server1.Url };
+                o.Servers = new[] { Context.Server2.Url, Context.Server1.Url };
                 o.SubChannelLength = 1;
 
                 using (IConnection
@@ -296,34 +393,37 @@ namespace IntegrationTests
                         }
                     };
 
-                    IAsyncSubscription sub1 = nc.SubscribeAsync("foo", eh);
-                    IAsyncSubscription sub2 = nc.SubscribeAsync("bar", eh);
-                    nc.Flush();
-
-                    ncp.Publish("foo", System.Text.Encoding.UTF8.GetBytes("hello"));
-                    ncp.Publish("bar", System.Text.Encoding.UTF8.GetBytes("hello"));
-                    ncp.Flush();
-
-                    recvCh.WaitOne(3000);
-
-                    for (int i = 0; i < 3; i++)
+                    using (IAsyncSubscription
+                        sub1 = nc.SubscribeAsync("foo", eh),
+                        sub2 = nc.SubscribeAsync("bar", eh))
                     {
+                        nc.Flush();
+
                         ncp.Publish("foo", System.Text.Encoding.UTF8.GetBytes("hello"));
                         ncp.Publish("bar", System.Text.Encoding.UTF8.GetBytes("hello"));
+                        ncp.Flush();
+
+                        recvCh.WaitOne(3000);
+
+                        for (int i = 0; i < 3; i++)
+                        {
+                            ncp.Publish("foo", System.Text.Encoding.UTF8.GetBytes("hello"));
+                            ncp.Publish("bar", System.Text.Encoding.UTF8.GetBytes("hello"));
+                        }
+
+                        ncp.Flush();
+
+                        Assert.True(asyncErr1.WaitOne(3000));
+                        Assert.True(asyncErr2.WaitOne(3000));
+
+                        serverNoAuth.Shutdown();
+
+                        Thread.Sleep(1000);
+                        closed.Reset();
+                        nc.Close();
+
+                        Assert.True(closed.WaitOne(3000));
                     }
-
-                    ncp.Flush();
-
-                    Assert.True(asyncErr1.WaitOne(3000));
-                    Assert.True(asyncErr2.WaitOne(3000));
-
-                    serverNoAuth.Shutdown();
-
-                    Thread.Sleep(1000);
-                    closed.Reset();
-                    nc.Close();
-
-                    Assert.True(closed.WaitOne(3000));
                 }
 
 
@@ -349,7 +449,7 @@ namespace IntegrationTests
                 }
             }
         }
-        
+
         [Fact]
         public void TestConnectionCloseAndDispose()
         {
@@ -388,11 +488,14 @@ namespace IntegrationTests
 
                 for (var i = 0; i < 1000; i++)
                 {
-                    IConnection c = Context.OpenConnection(Context.Server1.Port);
-                    var inboxName = c.NewInbox();
-                    c.Close();
-                    Assert.NotEqual(inboxName, lastInboxName);
-                    lastInboxName = inboxName;
+                    using (var c = Context.OpenConnection(Context.Server1.Port))
+                    {
+                        var inboxName = c.NewInbox();
+                        c.Close();
+
+                        Assert.NotEqual(inboxName, lastInboxName);
+                        lastInboxName = inboxName;
+                    }
                 }
             }
         }
@@ -402,7 +505,7 @@ namespace IntegrationTests
         {
             var reconnectEv = new AutoResetEvent(false);
             var closedEv = new AutoResetEvent(false);
-            
+
             var opts = Context.GetTestOptionsWithDefaultTimeout(Context.Server1.Port);
 
             opts.Timeout = 500;
@@ -451,10 +554,105 @@ namespace IntegrationTests
             }
         }
 
-        /// NOT IMPLEMENTED:
-        /// TestServerSecureConnections
-        /// TestErrOnConnectAndDeadlock
-        /// TestErrOnMaxPayloadLimit
+        [Fact]
+        public void CanConnectWhenHandshakeTimeoutIsSpecified()
+        {
+            var opts = Context.GetTestOptionsWithDefaultTimeout(Context.Server1.Port);
+            opts.AllowReconnect = false;
+            opts.Timeout = 500;
+
+            using (var s = NATSServer.CreateFastAndVerify(Context.Server1.Port))
+            {
+                using (var cn = Context.ConnectionFactory.CreateConnection(opts))
+                {
+                    Assert.False(cn.IsClosed());
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Category", "NATS 2.1.6+")]
+        public void TestClientIP()
+        {
+            IConnection conn;
+            using (NATSServer.CreateFastAndVerify(Context.Server1.Port))
+            {
+                conn = Context.ConnectionFactory.CreateConnection("nats://127.0.0.1:" + Context.Server1.Port);
+                Assert.Equal(conn.ClientIP.MapToIPv4(), System.Net.IPAddress.Parse("127.0.0.1"));
+                conn.Close();
+            }
+        }
+
+        [SkipPlatformsWithoutSignals]
+        public void TestLameDuckMode()
+        {
+            using (var s = NATSServer.CreateFastAndVerify(Context.Server1.Port))
+            {
+                var lameEv = new AutoResetEvent(false);
+                var opts = Context.GetTestOptions(Context.Server1.Port);
+                opts.LameDuckModeEventHandler = (sender, args) =>
+                {
+                    lameEv.Set();
+                };
+
+                using (Context.ConnectionFactory.CreateConnection(opts))
+                {
+                    s.SetLameDuckMode();
+                    Assert.True(lameEv.WaitOne(60000));
+                }
+            }
+        }
+
+        [SkipPlatformsWithoutSignals]
+        public void TestLameDuckModeNoCallback()
+        {
+            using (var s = NATSServer.CreateFastAndVerify(Context.Server1.Port))
+            {
+                var closedEv = new AutoResetEvent(false);
+
+                var opts = Context.GetTestOptions(Context.Server1.Port);
+                opts.AllowReconnect = false;
+
+                opts.DisconnectedEventHandler = (obj, args) =>
+                {
+                    closedEv.Set();
+                };
+
+                using (Context.ConnectionFactory.CreateConnection(opts))
+                {
+                    s.SetLameDuckMode();
+                    Assert.True(closedEv.WaitOne(20000));
+                }
+            }
+        }
+
+        [Fact]
+        public void TestLameDuckModeNotCalled()
+        {
+            using (var s = NATSServer.CreateFastAndVerify(Context.Server1.Port))
+            {
+                bool ldmCalled = false;
+                var closedEv = new AutoResetEvent(false);
+
+                var opts = Context.GetTestOptions(Context.Server1.Port);
+                opts.AllowReconnect = false;
+                opts.LameDuckModeEventHandler = (sender, args) =>
+                {
+                    ldmCalled = true;
+                };
+                opts.ClosedEventHandler = (sender, args) =>
+                {
+                    closedEv.Set();
+                };
+
+                using (Context.ConnectionFactory.CreateConnection(opts))
+                {
+                    s.Shutdown();
+                    Assert.True(closedEv.WaitOne(10000));
+                    Assert.False(ldmCalled);
+                }
+            }
+        }
     }
 
     public class TestConnectionSecurity : TestSuite<ConnectionSecuritySuiteContext>
@@ -470,7 +668,8 @@ namespace IntegrationTests
 
                 // See nkey.conf
                 opts.SetNkey("UCKKTOZV72L3NITTGNOCRDZUI5H632XCT4ZWPJBC2X3VEY72KJUWEZ2Z", "./config/certs/user.nk");
-                Context.ConnectionFactory.CreateConnection(opts).Close();
+                using(var cn = Context.ConnectionFactory.CreateConnection(opts))
+                    cn.Close();
             }
         }
 
@@ -482,8 +681,11 @@ namespace IntegrationTests
                 var opts = Context.GetTestOptionsWithDefaultTimeout(Context.Server1.Port);
 
                 opts.SetNkey("XXKKTOZV72L3NITTGNOCRDZUI5H632XCT4ZWPJBC2X3VEY72KJUWEZ2Z", "./config/certs/user.nk");
-                Assert.Throws<NATSConnectionException>(()=> Context.ConnectionFactory.CreateConnection(opts).Close());
-
+                Assert.Throws<NATSConnectionException>(()=>
+                {
+                    using(var cn = Context.ConnectionFactory.CreateConnection(opts))
+                        cn.Close();
+                });
                 
                 Assert.Throws<ArgumentException>(() => opts.SetNkey("", "./config/certs/user.nk"));
                 Assert.Throws<ArgumentException>(() => opts.SetNkey("UCKKTOZV72L3NITTGNOCRDZUI5H632XCT4ZWPJBC2X3VEY72KJUWEZ2Z", ""));
@@ -493,23 +695,25 @@ namespace IntegrationTests
         [Fact]
         public void Test20Security()
         {
-            IConnection c = null;
             AutoResetEvent ev = new AutoResetEvent(false);
-            using (NATSServer.CreateWithConfig(Context.Server1.Port, "operator.conf"))
+            using (var s1 = NATSServer.CreateWithConfig(Context.Server1.Port, "operator.conf"))
             {
                 var opts = Context.GetTestOptionsWithDefaultTimeout(Context.Server1.Port);
                 opts.ReconnectedEventHandler += (obj, args) => {
                     ev.Set();
                 };
                 opts.SetUserCredentials("./config/certs/test.creds");
-                c = Context.ConnectionFactory.CreateConnection(opts);
-            }
+                using (Context.ConnectionFactory.CreateConnection(opts))
+                {
+                    s1.Shutdown();
 
-            // effectively bounce the server
-            using (NATSServer.CreateWithConfig(Context.Server1.Port, "operator.conf"))
-            {
-                // wait for reconnect.
-                Assert.True(ev.WaitOne(60000));
+                    // effectively bounce the server
+                    using (NATSServer.CreateWithConfig(Context.Server1.Port, "operator.conf"))
+                    {
+                        // wait for reconnect.
+                        Assert.True(ev.WaitOne(60000));
+                    }
+                }
             }
         }
 
@@ -519,8 +723,10 @@ namespace IntegrationTests
             using (NATSServer.CreateWithConfig(Context.Server1.Port, "operator.conf"))
             {
                 var serverUrl = Context.Server1.Url;
-                Context.ConnectionFactory.CreateConnection(serverUrl, "./config/certs/test.creds").Close();
-                Context.ConnectionFactory.CreateConnection(serverUrl, "./config/certs/test.creds", "./config/certs/test.creds").Close();
+                using(var cn = Context.ConnectionFactory.CreateConnection(serverUrl, "./config/certs/test.creds"))
+                    cn.Close();
+                using(var cn = Context.ConnectionFactory.CreateConnection(serverUrl, "./config/certs/test.creds", "./config/certs/test.creds"))
+                    cn.Close();
 
                 Assert.Throws<ArgumentException>(() => Context.ConnectionFactory.CreateConnection(serverUrl, ""));
                 Assert.Throws<ArgumentException>(() => Context.ConnectionFactory.CreateConnection(serverUrl, null));
@@ -616,7 +822,8 @@ namespace IntegrationTests
                 };
                 var opts = Context.GetTestOptionsWithDefaultTimeout(Context.Server1.Port);
                 opts.SetUserCredentialHandlers(jwtEh, sigEh);
-                Context.ConnectionFactory.CreateConnection(opts).Close();
+                using(var cn = Context.ConnectionFactory.CreateConnection(opts))
+                    cn.Close();
             }
         }
 
@@ -628,35 +835,29 @@ namespace IntegrationTests
                 var opts = Context.GetTestOptions(Context.Server1.Port);
                 opts.Token = "foo";
 
-                var c = Context.ConnectionFactory.CreateConnection(opts);
-                c.Close();
+                using(var c = Context.ConnectionFactory.CreateConnection(opts))
+                    c.Close();
 
                 opts.Token = "garbage";
-                Assert.Throws<NATSConnectionException>(() => { Context.ConnectionFactory.CreateConnection(opts); });
+                Assert.Throws<NATSConnectionException>(() => Context.ConnectionFactory.CreateConnection(opts));
             }
 
-            using (NATSServer.Create(Context.Server1.Port, $"--user foo --pass b@r"))
+            using (NATSServer.Create(Context.Server1.Port, "--user foo --pass b@r"))
             {
                 var opts = Context.GetTestOptions(Context.Server1.Port);
                 opts.User = "foo";
                 opts.Password = "b@r";
                 
-                var c = Context.ConnectionFactory.CreateConnection(opts);
-                c.Close();
+                using(var c = Context.ConnectionFactory.CreateConnection(opts))
+                    c.Close();
 
                 opts.Password = "garbage";
-                Assert.Throws<NATSConnectionException>(() => { Context.ConnectionFactory.CreateConnection(opts); });
+                Assert.Throws<NATSConnectionException>(() => Context.ConnectionFactory.CreateConnection(opts));
 
                 opts.User = "baz";
                 opts.Password = "bar";
-                Assert.Throws<NATSConnectionException>(() => { Context.ConnectionFactory.CreateConnection(opts); });
+                Assert.Throws<NATSConnectionException>(() => Context.ConnectionFactory.CreateConnection(opts));
             }
-        }
-
-        [Fact(Skip = "WorkInProgress")]
-        public void TestJwtFunctionality()
-        {
-            //using (NATSServer.CreateFastAndVerify(Context.Server1.Port)) { }
         }
     }
 
@@ -669,32 +870,35 @@ namespace IntegrationTests
         {
             using (NATSServer.CreateFastAndVerify(Context.Server1.Port))
             {
-                var c = Context.OpenConnection(Context.Server1.Port);
-
-                AutoResetEvent done = new AutoResetEvent(false);
-                int received = 0;
-                int expected = 10;
-
-                var s = c.SubscribeAsync("foo", (obj, args) =>
+                using (var c = Context.OpenConnection(Context.Server1.Port))
                 {
-                    // allow messages to back up
-                    Thread.Sleep(100);
+                    AutoResetEvent done = new AutoResetEvent(false);
+                    int received = 0;
+                    int expected = 10;
 
-                    int count = Interlocked.Increment(ref received);
-                    if (count == expected)
+                    using (c.SubscribeAsync("foo", (obj, args) =>
                     {
-                        done.Set();
+                        // allow messages to back up
+                        Thread.Sleep(100);
+
+                        int count = Interlocked.Increment(ref received);
+                        if (count == expected)
+                        {
+                            done.Set();
+                        }
+                    }))
+                    {
+                        for (int i = 0; i < expected; i++)
+                        {
+                            c.Publish("foo", null);
+                        }
+
+                        c.Drain();
+
+                        done.WaitOne(5000);
+                        Assert.True(received == expected, string.Format("received {0} of {1}", received, expected));
                     }
-                });
-
-                for (int i = 0; i < expected; i++)
-                {
-                    c.Publish("foo", null);
                 }
-                c.Drain();
-
-                done.WaitOne(5000);
-                Assert.True(received == expected, string.Format("recieved {0} of {1}", received, expected));
             }
         }
 
@@ -703,38 +907,41 @@ namespace IntegrationTests
         {
             using (NATSServer.CreateFastAndVerify(Context.Server1.Port))
             {
-                var c = Context.OpenConnection(Context.Server1.Port);
-
-                AutoResetEvent done = new AutoResetEvent(false);
-                int received = 0;
-                int expected = 10;
-
-                var s = c.SubscribeAsync("foo", (obj, args) =>
+                using (var c = Context.OpenConnection(Context.Server1.Port))
                 {
-                    // allow messages to back up
-                    Thread.Sleep(250);
+                    AutoResetEvent done = new AutoResetEvent(false);
+                    int received = 0;
+                    int expected = 10;
 
-                    int count = Interlocked.Increment(ref received);
-                    if (count == expected)
+                    using (c.SubscribeAsync("foo", (obj, args) =>
                     {
-                        done.Set();
+                        // allow messages to back up
+                        Thread.Sleep(250);
+
+                        int count = Interlocked.Increment(ref received);
+                        if (count == expected)
+                        {
+                            done.Set();
+                        }
+                    }))
+                    {
+                        for (int i = 0; i < expected; i++)
+                        {
+                            c.Publish("foo", null);
+                        }
+
+                        var sw = Stopwatch.StartNew();
+                        var t = c.DrainAsync();
+                        sw.Stop();
+
+                        // are we really async?
+                        Assert.True(sw.ElapsedMilliseconds < 2500);
+                        t.Wait();
+
+                        done.WaitOne(5000);
+                        Assert.True(received == expected, string.Format("received {0} of {1}", received, expected));
                     }
-                });
-
-                for (int i = 0; i < expected; i++)
-                {
-                    c.Publish("foo", null);
                 }
-                var sw = Stopwatch.StartNew();
-                var t = c.DrainAsync();
-                sw.Stop();
-
-                // are we really async?
-                Assert.True(sw.ElapsedMilliseconds < 2500);
-                t.Wait();
-
-                done.WaitOne(5000);
-                Assert.True(received == expected, string.Format("recieved {0} of {1}", received, expected));
             }
         }
 
@@ -743,32 +950,35 @@ namespace IntegrationTests
         {
             using (NATSServer.CreateFastAndVerify(Context.Server1.Port))
             {
-                var c = Context.OpenConnection(Context.Server1.Port);
-
-                AutoResetEvent done = new AutoResetEvent(false);
-                int received = 0;
-                int expected = 10;
-
-                var s = c.SubscribeAsync("foo", (obj, args) =>
+                using (var c = Context.OpenConnection(Context.Server1.Port))
                 {
-                    // allow messages to back up
-                    Thread.Sleep(100);
+                    AutoResetEvent done = new AutoResetEvent(false);
+                    int received = 0;
+                    int expected = 10;
 
-                    int count = Interlocked.Increment(ref received);
-                    if (count == expected)
+                    using (var s = c.SubscribeAsync("foo", (obj, args) =>
                     {
-                        done.Set();
+                        // allow messages to back up
+                        Thread.Sleep(100);
+
+                        int count = Interlocked.Increment(ref received);
+                        if (count == expected)
+                        {
+                            done.Set();
+                        }
+                    }))
+                    {
+                        for (int i = 0; i < expected; i++)
+                        {
+                            c.Publish("foo", null);
+                        }
+
+                        s.Drain();
+
+                        done.WaitOne(5000);
+                        Assert.True(received == expected, string.Format("received {0} of {1}", received, expected));
                     }
-                });
-
-                for (int i = 0; i < expected; i++)
-                {
-                    c.Publish("foo", null);
                 }
-                s.Drain();
-
-                done.WaitOne(5000);
-                Assert.True(received == expected, string.Format("recieved {0} of {1}", received, expected));
             }
         }
 
@@ -777,38 +987,41 @@ namespace IntegrationTests
         {
             using (NATSServer.CreateFastAndVerify(Context.Server1.Port))
             {
-                var c = Context.OpenConnection(Context.Server1.Port);
-
-                AutoResetEvent done = new AutoResetEvent(false);
-                int received = 0;
-                int expected = 10;
-
-                var s = c.SubscribeAsync("foo", (obj, args) =>
+                using (var c = Context.OpenConnection(Context.Server1.Port))
                 {
-                    // allow messages to back up
-                    Thread.Sleep(100);
+                    AutoResetEvent done = new AutoResetEvent(false);
+                    int received = 0;
+                    int expected = 10;
 
-                    int count = Interlocked.Increment(ref received);
-                    if (count == expected)
+                    using (var s = c.SubscribeAsync("foo", (obj, args) =>
                     {
-                        done.Set();
+                        // allow messages to back up
+                        Thread.Sleep(100);
+
+                        int count = Interlocked.Increment(ref received);
+                        if (count == expected)
+                        {
+                            done.Set();
+                        }
+                    }))
+                    {
+                        for (int i = 0; i < expected; i++)
+                        {
+                            c.Publish("foo", null);
+                        }
+
+                        var sw = Stopwatch.StartNew();
+                        var t = s.DrainAsync();
+                        sw.Stop();
+
+                        // are we really async?
+                        Assert.True(sw.ElapsedMilliseconds < 1000);
+                        t.Wait();
+
+                        done.WaitOne(5000);
+                        Assert.True(received == expected, string.Format("received {0} of {1}", received, expected));
                     }
-                });
-
-                for (int i = 0; i < expected; i++)
-                {
-                    c.Publish("foo", null);
                 }
-                var sw = Stopwatch.StartNew();
-                var t = s.DrainAsync();
-                sw.Stop();
-
-                // are we really async?
-                Assert.True(sw.ElapsedMilliseconds < 1000);
-                t.Wait();
-
-                done.WaitOne(5000);
-                Assert.True(received == expected, string.Format("recieved {0} of {1}", received, expected));
             }
         }
 
@@ -817,16 +1030,20 @@ namespace IntegrationTests
         {
             using (NATSServer.CreateFastAndVerify(Context.Server1.Port))
             {
-                var c = Context.OpenConnection(Context.Server1.Port);
-                var s = c.SubscribeAsync("foo");
-                Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => c.DrainAsync(-1));
-                Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => c.DrainAsync(0));
-                Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => s.DrainAsync(-1));
-                Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => s.DrainAsync(0));
-                Assert.Throws<ArgumentOutOfRangeException>(() => c.Drain(-1));
-                Assert.Throws<ArgumentOutOfRangeException>(() => c.Drain(0));
-                Assert.Throws<ArgumentOutOfRangeException>(() => s.Drain(-1));
-                Assert.Throws<ArgumentOutOfRangeException>(() => s.Drain(0));
+                using (var c = Context.OpenConnection(Context.Server1.Port))
+                {
+                    using (var s = c.SubscribeAsync("foo"))
+                    {
+                        Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => c.DrainAsync(-1));
+                        Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => c.DrainAsync(0));
+                        Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => s.DrainAsync(-1));
+                        Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => s.DrainAsync(0));
+                        Assert.Throws<ArgumentOutOfRangeException>(() => c.Drain(-1));
+                        Assert.Throws<ArgumentOutOfRangeException>(() => c.Drain(0));
+                        Assert.Throws<ArgumentOutOfRangeException>(() => s.Drain(-1));
+                        Assert.Throws<ArgumentOutOfRangeException>(() => s.Drain(0));
+                    }
+                }
             }
         }
 
@@ -835,31 +1052,36 @@ namespace IntegrationTests
         {
             using (NATSServer.CreateFastAndVerify(Context.Server1.Port))
             {
-                var c = Context.OpenConnection(Context.Server1.Port);
-                var s = c.SubscribeAsync("foo", (obj, args) =>
+                using (var c = Context.OpenConnection(Context.Server1.Port))
                 {
-                    // allow about 30s of messages to back up
-                    Thread.Sleep(1000);
-                });
+                    using (c.SubscribeAsync("foo", (obj, args) =>
+                    {
+                        // allow about 30s of messages to back up
+                        Thread.Sleep(1000);
+                    }))
+                    {
+                        for (int i = 0; i < 30; i++)
+                        {
+                            c.Publish("foo", null);
+                        }
 
-                for (int i = 0; i < 30; i++)
-                {
-                    c.Publish("foo", null);
-                }
-                Stopwatch sw = Stopwatch.StartNew();
-                var t = c.DrainAsync(1000);
-                try
-                {
-                    t.Wait();
-                }
-                catch (Exception)
-                {
-                    // timed out.
-                }
-                sw.Stop();
+                        Stopwatch sw = Stopwatch.StartNew();
+                        var t = c.DrainAsync(1000);
+                        try
+                        {
+                            t.Wait();
+                        }
+                        catch (Exception)
+                        {
+                            // timed out.
+                        }
 
-                // add slack for slow CI.
-                Assert.True(sw.ElapsedMilliseconds >= 1000);
+                        sw.Stop();
+
+                        // add slack for slow CI.
+                        Assert.True(sw.ElapsedMilliseconds >= 1000);
+                    }
+                }
             }
         }
 
@@ -868,23 +1090,27 @@ namespace IntegrationTests
         {
             using (NATSServer.CreateFastAndVerify(Context.Server1.Port))
             {
-                var c = Context.OpenConnection(Context.Server1.Port);
-                var s = c.SubscribeAsync("foo", (obj, args) =>
+                using (var c = Context.OpenConnection(Context.Server1.Port))
                 {
-                    // allow about 30s of messages to back up
-                    Thread.Sleep(100);
-                });
+                    using (c.SubscribeAsync("foo", (obj, args) =>
+                    {
+                        // allow about 30s of messages to back up
+                        Thread.Sleep(100);
+                    }))
+                    {
+                        for (int i = 0; i < 30; i++)
+                        {
+                            c.Publish("foo", null);
+                        }
 
-                for (int i = 0; i < 30; i++)
-                {
-                    c.Publish("foo", null);
+                        Stopwatch sw = Stopwatch.StartNew();
+                        Assert.Throws<NATSTimeoutException>(() => c.Drain(500));
+                        sw.Stop();
+
+                        // add slack for slow CI.
+                        Assert.True(sw.ElapsedMilliseconds >= 500);
+                    }
                 }
-                Stopwatch sw = Stopwatch.StartNew();
-                Assert.Throws<NATSTimeoutException>(() => c.Drain(500));
-                sw.Stop();
-
-                // add slack for slow CI.
-                Assert.True(sw.ElapsedMilliseconds >= 500);
             }
         }
 
@@ -903,30 +1129,34 @@ namespace IntegrationTests
                     ev.Set();
                 };
 
-                var c = Context.ConnectionFactory.CreateConnection(opts);
-                var s = c.SubscribeAsync("foo", (obj, args) =>
+                using (var c = Context.ConnectionFactory.CreateConnection(opts))
                 {
-                    // allow about 30s of messages to back up
-                    Thread.Sleep(1000);
-                });
+                    using (var s = c.SubscribeAsync("foo", (obj, args) =>
+                    {
+                        // allow about 30s of messages to back up
+                        Thread.Sleep(1000);
+                    }))
+                    {
+                        for (int i = 0; i < 30; i++)
+                        {
+                            c.Publish("foo", null);
+                        }
 
-                for (int i = 0; i < 30; i++)
-                {
-                    c.Publish("foo", null);
+                        Stopwatch sw = Stopwatch.StartNew();
+                        Assert.Throws<NATSTimeoutException>(() => s.Drain(500));
+                        sw.Stop();
+
+                        // add slack for slow CI.
+                        Assert.True(sw.ElapsedMilliseconds >= 500);
+                        Assert.True(ev.WaitOne(4000));
+                        Assert.True(aehHit);
+                    }
                 }
-                Stopwatch sw = Stopwatch.StartNew();
-                Assert.Throws<NATSTimeoutException>(()=> s.Drain(500));
-                sw.Stop();
-
-                // add slack for slow CI.
-                Assert.True(sw.ElapsedMilliseconds >= 500);
-                Assert.True(ev.WaitOne(4000));
-                Assert.True(aehHit);
             }
         }
 
         [Fact]
-        public void TestDrainStateBehavior()
+        public async Task TestDrainStateBehavior()
         {
             using (NATSServer.CreateFastAndVerify(Context.Server1.Port))
             {
@@ -935,30 +1165,95 @@ namespace IntegrationTests
                 var opts = Context.GetTestOptionsWithDefaultTimeout(Context.Server1.Port);
                 opts.ClosedEventHandler = (obj, args) =>
                 {
-                    closed.Set(); 
+                    closed.Set();
                 };
-                var c = Context.ConnectionFactory.CreateConnection(opts);
-                var s = c.SubscribeAsync("foo", (obj, args) =>
-                {
-                    // allow about 5s of messages to back up
-                    Thread.Sleep(500);
-                });
 
-                for (int i = 0; i < 10; i++)
+                using (var c = Context.ConnectionFactory.CreateConnection(opts))
                 {
-                    c.Publish("foo", null);
+                    using (c.SubscribeAsync("foo", (obj, args) =>
+                    {
+                        // allow about 5s of messages to back up
+                        Thread.Sleep(500);
+                    }))
+                    {
+                        for (int i = 0; i < 10; i++)
+                        {
+                            c.Publish("foo", null);
+                        }
+
+                        // give us a long timeout to run our test.
+                        var drainTask = c.DrainAsync(10000);
+
+                        // Sleep a bit to ensure the drain task is running.
+                        Thread.Sleep(100);
+                        Assert.True(c.State == ConnState.DRAINING_SUBS);
+                        Assert.True(c.IsDraining());
+
+                        Assert.Throws<NATSConnectionDrainingException>(() => c.SubscribeAsync("foo"));
+                        Assert.Throws<NATSConnectionDrainingException>(() => c.SubscribeSync("foo"));
+
+                        await drainTask;
+
+                        Assert.Equal(ConnState.CLOSED, c.State);
+                        Assert.False(c.IsDraining());
+
+                        // Make sure we hit connection closed.
+                        Assert.True(closed.WaitOne(10000));
+                    }
                 }
-                // give us a long timeout to run our test.
-                c.DrainAsync(10000);
 
-                Assert.True(c.State == ConnState.DRAINING_SUBS);
-                Assert.True(c.IsDraining());
+                // Now test connection state checking in drain after being closed via API.
+                var conn = Context.ConnectionFactory.CreateConnection(opts);
+                conn.Close();
+                _ = Assert.Throws<NATSConnectionClosedException>(() => conn.Drain());
+                await Assert.ThrowsAsync<NATSConnectionClosedException>(() => { return conn.DrainAsync(); });
+            }
+        }
 
-                Assert.Throws<NATSConnectionDrainingException>(() => c.SubscribeAsync("foo"));
-                Assert.Throws<NATSConnectionDrainingException>(() => c.SubscribeSync("foo"));
+        [Fact]
+        public void TestFlushBuffer()
+        {
+            AutoResetEvent disconnected = new AutoResetEvent(false);
+            AutoResetEvent closed = new AutoResetEvent(false);
 
-                // Make sure we hit connection closed.
-                Assert.True(closed.WaitOne(10000));
+            using (var s1 = NATSServer.CreateFastAndVerify(Context.Server1.Port))
+            {
+                var opts = Context.GetTestOptionsWithDefaultTimeout(Context.Server1.Port);
+                opts.ClosedEventHandler = (obj, args) =>
+                {
+                    closed.Set();
+                };
+                opts.DisconnectedEventHandler = (obj, args) =>
+                {
+                    disconnected.Set();
+                };
+
+                using (var c = Context.ConnectionFactory.CreateConnection(opts))
+                {
+                    // test empty buffer
+                    c.FlushBuffer();
+                    // test multiple calls
+                    c.FlushBuffer();
+
+                    c.Publish("foo", new byte[10240]);
+                    c.FlushBuffer();   
+                    
+                    s1.Shutdown();
+                    
+                    // wait until we're disconnected
+                    Assert.True(disconnected.WaitOne(10000));
+
+                    // Be sure we're reconnecting
+                    Assert.True(c.State == ConnState.RECONNECTING);
+
+                    // should be a NOOP
+                    c.FlushBuffer();
+
+                    // close and then check the closed connection.
+                    c.Close();
+                    Assert.True(closed.WaitOne(10000));
+                    Assert.Throws<NATSConnectionClosedException>(() => c.FlushBuffer());
+                }
             }
         }
     }
@@ -1019,21 +1314,25 @@ namespace IntegrationTests
                     count++;
                     var opts = Context.GetTestOptionsWithDefaultTimeout(Context.Server2.Port);
                     using (IConnection conn = Context.ConnectionFactory.CreateConnection(opts)) {
-                        conn.SubscribeAsync("foo", (obj, args) =>
+                        using(conn.SubscribeAsync("foo", (obj, args) =>
                         {
                             // NOOP
-                        });
-
-                        var sub = conn.SubscribeAsync("foo");
-                        sub.MessageHandler += (obj, args) =>
+                        }))
                         {
-                            // NOOP
-                        };
-                        sub.Start();
+                            using(var sub = conn.SubscribeAsync("foo"))
+                            {
+                                sub.MessageHandler += (obj, args) =>
+                                {
+                                    // NOOP
+                                };
+                                sub.Start();
 
-                        conn.SubscribeSync("foo");
-
-                        conn.Close();
+                                using(conn.SubscribeSync("foo"))
+                                {
+                                    conn.Close();
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1060,48 +1359,67 @@ namespace IntegrationTests
 
                     var startMem = GC.GetTotalMemory(true);
 
-                    c.SubscribeAsync(subject, (sender, args) =>
+                    using(c.SubscribeAsync(subject, (sender, args) =>
                     {
                         c.Publish(args.Message.Reply, data);
                         c.Flush();
-                    });
-
-                    for (int i = 0; i < 100; i++)
+                    }))
                     {
-                        var msg = c.Request(subject, data, int.MaxValue);
+                        for (int i = 0; i < 100; i++)
+                        {
+                            var msg = c.Request(subject, data, int.MaxValue);
+                        }
+                        GC.Collect();
+                        Thread.Sleep(5000);
+
+                        double memGrowthPercent = 100 * (((double)(GC.GetTotalMemory(false) - startMem)) / (double)startMem);
+                        Assert.True(memGrowthPercent < 30.0, string.Format("Memory grew {0} percent.", memGrowthPercent));
+
+                        startMem = GC.GetTotalMemory(true);
+                        for (int i = 0; i < 100; i++)
+                        {
+                            c.Request(subject, data);
+                        }
+                        GC.Collect();
+                        Thread.Sleep(5000);
+
+                        memGrowthPercent = 100 * (((double)(GC.GetTotalMemory(false) - startMem)) / (double)startMem);
+                        Assert.True(memGrowthPercent < 30.0, string.Format("Memory grew {0} percent.", memGrowthPercent));
+
+                        startMem = GC.GetTotalMemory(true);
+                        var token = new CancellationToken();
+                        for (int i = 0; i < 100; i++)
+                        {
+                            var t = c.RequestAsync(subject, data, int.MaxValue, token);
+                            t.Wait();
+                        }
+                        GC.Collect();
+                        Thread.Sleep(5000);
+
+                        memGrowthPercent = 100 * (((double)(GC.GetTotalMemory(false) - startMem)) / (double)startMem);
+                        Assert.True(memGrowthPercent < 30.0, string.Format("Memory grew {0} percent.", memGrowthPercent));
                     }
-                    GC.Collect();
-                    Thread.Sleep(5000);
-
-                    double memGrowthPercent = 100 * (((double)(GC.GetTotalMemory(false) - startMem)) / (double)startMem);
-                    Assert.True(memGrowthPercent < 30.0, string.Format("Memory grew {0} percent.", memGrowthPercent));
-
-                    startMem = GC.GetTotalMemory(true);
-                    for (int i = 0; i < 100; i++)
-                    {
-                        c.Request(subject, data);
-                    }
-                    GC.Collect();
-                    Thread.Sleep(5000);
-
-                    memGrowthPercent = 100 * (((double)(GC.GetTotalMemory(false) - startMem)) / (double)startMem);
-                    Assert.True(memGrowthPercent < 30.0, string.Format("Memory grew {0} percent.", memGrowthPercent));
-
-                    startMem = GC.GetTotalMemory(true);
-                    var token = new CancellationToken();
-                    for (int i = 0; i < 100; i++)
-                    {
-                        var t = c.RequestAsync(subject, data, int.MaxValue, token);
-                        t.Wait();
-                    }
-                    GC.Collect();
-                    Thread.Sleep(5000);
-
-                    memGrowthPercent = 100 * (((double)(GC.GetTotalMemory(false) - startMem)) / (double)startMem);
-                    Assert.True(memGrowthPercent < 30.0, string.Format("Memory grew {0} percent.", memGrowthPercent));
                 }
             }
         }
 #endif
+    }
+
+    public class TestIpV6Connection : TestSuite<ConnectionIpV6SuiteContext>
+    {
+        public TestIpV6Connection(ConnectionIpV6SuiteContext context) : base(context) { }
+
+        [Fact]
+        public void CanConnectUsingIpV6()
+        {
+            var opts = Context.GetTestOptions(Context.Server1.Port);
+            opts.Url = $"nats://[::1]:{Context.Server1.Port}";
+
+            using (NATSServer.CreateFastAndVerify(Context.Server1.Port))
+            {
+                using (var cn = Context.ConnectionFactory.CreateConnection(opts))
+                    Assert.True(cn.State == ConnState.CONNECTED, $"Failed to connect. Expected '{ConnState.CONNECTED}' got '{cn.State}'");
+            }
+        }
     }
 }

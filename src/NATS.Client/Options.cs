@@ -12,6 +12,7 @@
 // limitations under the License.
 
 using System;
+using System.Linq;
 using System.Text;
 using System.Security.Cryptography.X509Certificates;
 using System.Net.Security;
@@ -38,6 +39,8 @@ namespace NATS.Client
         int reconnectWait = Defaults.ReconnectWait;
         int pingInterval  = Defaults.PingInterval;
         int timeout       = Defaults.Timeout;
+        int reconnectJitter = Defaults.ReconnectJitter;
+        int reconnectJitterTLS = Defaults.ReconnectJitterTLS;
 
         internal X509Certificate2Collection certificates = null;
  
@@ -70,6 +73,31 @@ namespace NATS.Client
         /// when an error occurs out of band.
         /// </summary>
         public EventHandler<ErrEventArgs> AsyncErrorEventHandler = null;
+
+        /// <summary>
+        /// Represents the method that will handle an event raised
+        /// when the server notifies the connection that it entered lame duck mode.
+        /// </summary>
+        /// <remarks>
+        /// A server in lame duck mode will gradually disconnect all its connections
+        /// before shuting down. This is often used in deployments when upgrading
+        /// NATS Servers.
+        /// </remarks>
+        public EventHandler<ConnEventArgs> LameDuckModeEventHandler = null;
+
+        /// <summary>
+        /// Represents the optional method that is used to get from the
+        /// user the desired delay the client should pause before attempting
+        /// to reconnect again.
+        /// </summary>
+        /// <remarks>
+        /// Note that this is invoked after the library tried the
+        /// entire list of URLs and failed to reconnect.  By default, the client
+        /// will use the sum of <see cref="ReconnectWait"/> and a random value between
+        /// zero and <see cref="Options.ReconnectJitter"/> or
+        /// <see cref="Options.ReconnectJitterTLS"/>
+        /// </remarks>
+        public EventHandler<ReconnectDelayEventArgs> ReconnectDelayHandler = null;
 
         /// <summary>
         /// Represents the optional method that is used to fetch and
@@ -151,7 +179,7 @@ namespace NATS.Client
         /// sign the server nonce.
         /// </summary>
         /// <param name="publicNkey">The User's public Nkey</param>
-        /// <param name="privateKeyPath">A path to a file contianing the private Nkey.</param>
+        /// <param name="privateKeyPath">A path to a file containing the private Nkey.</param>
         public void SetNkey(string publicNkey, string privateKeyPath)
         {
             if (string.IsNullOrWhiteSpace(publicNkey)) throw new ArgumentException("Invalid publicNkey", nameof(publicNkey));
@@ -182,11 +210,14 @@ namespace NATS.Client
 
         // Must be greater than 0.
         internal int subscriptionBatchSize = 64;
+        internal int reconnectBufSize = Defaults.ReconnectBufferSize;
 
         internal string user;
         internal string password;
         internal string token;
         internal string nkey;
+
+        internal string customInboxPrefix;
 
         // Options can only be publicly created through 
         // ConnectionFactory.GetDefaultOptions();
@@ -202,15 +233,20 @@ namespace NATS.Client
             DisconnectedEventHandler = o.DisconnectedEventHandler;
             UserJWTEventHandler = o.UserJWTEventHandler;
             UserSignatureEventHandler = o.UserSignatureEventHandler;
+            ReconnectDelayHandler = o.ReconnectDelayHandler;
+            LameDuckModeEventHandler = o.LameDuckModeEventHandler;
             maxPingsOut = o.maxPingsOut;
             maxReconnect = o.maxReconnect;
             name = o.name;
             noRandomize = o.noRandomize;
             noEcho = o.noEcho;
             pedantic = o.pedantic;
+            reconnectBufSize = o.reconnectBufSize;
             useOldRequestStyle = o.useOldRequestStyle;
             pingInterval = o.pingInterval;
             ReconnectedEventHandler = o.ReconnectedEventHandler;
+            reconnectJitter = o.reconnectJitter;
+            reconnectJitterTLS = o.reconnectJitterTLS;
             reconnectWait = o.reconnectWait;
             secure = o.secure;
             user = o.user;
@@ -220,6 +256,7 @@ namespace NATS.Client
             verbose = o.verbose;
             subscriberDeliveryTaskCount = o.subscriberDeliveryTaskCount;
             subscriptionBatchSize = o.subscriptionBatchSize;
+            customInboxPrefix = o.customInboxPrefix;
 
             if (o.url != null)
             {
@@ -240,6 +277,26 @@ namespace NATS.Client
             {
                 certificates = new X509Certificate2Collection(o.certificates);
             }
+        }
+
+        static readonly string[] protcolSep = new[] {"://"};
+        
+        static string ensureProperUrl(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+                return url;
+            
+            if (url.StartsWith("nats://", StringComparison.OrdinalIgnoreCase))
+                return url;
+
+            if (url.StartsWith("tls://", StringComparison.OrdinalIgnoreCase))
+                return url;
+
+            var parts = url.Split(protcolSep, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 1)
+                return $"nats://{url}";
+            
+            throw new ArgumentException("Allowed protocols are: 'nats://, tls://'.");
         }
 
         internal void processUrlString(string url)
@@ -265,11 +322,14 @@ namespace NATS.Client
         public string Url
         {
             get { return url; }
-            set { url = value; }
+            set
+            {
+                url = ensureProperUrl(value);
+            }
         }
 
         /// <summary>
-        /// Gets or sets the array of servers that the NATs client will connect to.
+        /// Gets or sets the array of servers that the NATS client will connect to.
         /// </summary>
         /// <remarks>
         /// The individual URLs may contain username/password information.
@@ -277,7 +337,10 @@ namespace NATS.Client
         public string[] Servers
         {
             get { return servers; }
-            set { servers = value; }
+            set
+            {
+                servers = value?.Select(ensureProperUrl).ToArray();
+            }
         }
 
         /// <summary>
@@ -462,12 +525,27 @@ namespace NATS.Client
         }
 
         /// <summary>
-        /// Adds an X.509 certifcate from a file for use with a secure connection.
+        /// Gets or sets a custom inbox prefix.
+        /// </summary>
+        public string CustomInboxPrefix
+        {
+            get => customInboxPrefix;
+            set
+            {
+                if (value != null && !Subscription.IsValidPrefix(value))
+                    throw new ArgumentException("Prefix would result in an invalid subject.");
+
+                customInboxPrefix = value;
+            }
+        }
+
+        /// <summary>
+        /// Adds an X.509 certificate from a file for use with a secure connection.
         /// </summary>
         /// <param name="fileName">Path to the certificate file to add.</param>
         /// <exception cref="ArgumentNullException"><paramref name="fileName"/> is <c>null</c>.</exception>
         /// <exception cref="System.Security.Cryptography.CryptographicException">An error with the certificate
-        /// ocurred. For example:
+        /// occurred. For example:
         /// <list>
         /// <item>The certificate file does not exist.</item>
         /// <item>The certificate is invalid.</item>
@@ -481,12 +559,12 @@ namespace NATS.Client
         }
 
         /// <summary>
-        /// Adds an X.509 certifcate for use with a secure connection.
+        /// Adds an X.509 certificate for use with a secure connection.
         /// </summary>
         /// <param name="certificate">An X.509 certificate represented as an <see cref="X509Certificate2"/> object.</param>
         /// <exception cref="ArgumentNullException"><paramref name="certificate"/> is <c>null</c>.</exception>
         /// <exception cref="System.Security.Cryptography.CryptographicException">An error with the certificate
-        /// ocurred. For example:
+        /// occurred. For example:
         /// <list>
         /// <item>The certificate file does not exist.</item>
         /// <item>The certificate is invalid.</item>
@@ -585,6 +663,85 @@ namespace NATS.Client
                 sb.AppendFormat("{0}=null;", name);
         }
 
+        
+        /// <summary>
+        /// Constant used to sets the reconnect buffer size to unbounded.
+        /// </summary>
+        /// <seealso cref="ReconnectBufferSize"/>
+        public static readonly int ReconnectBufferSizeUnbounded = 0;
+
+        /// <summary>
+        /// Constant that disables the reconnect buffer.
+        /// </summary>
+        /// <seealso cref="ReconnectBufferSize"/>
+        public static readonly int ReconnectBufferDisabled = -1;
+
+        /// <summary>
+        /// Gets or sets the buffer size of messages kept while busy reconnecting.
+        /// </summary>
+        /// <remarks>
+        /// When reconnecting, the NATS client will hold published messages that
+        /// will be flushed to the new server upon a successful reconnect.  The default
+        /// is buffer size is 8 MB.  This buffering can be disabled.
+        /// </remarks>
+        /// <seealso cref="ReconnectBufferSizeUnbounded"/>
+        /// <seealso cref="ReconnectBufferDisabled"/>
+        public int ReconnectBufferSize
+        {
+            get { return reconnectBufSize; }
+            set
+            {
+                if (value < -1)
+                {
+                    throw new ArgumentOutOfRangeException("value", "Reconnect buffer size must be greater than or equal to -1");
+                }
+
+                reconnectBufSize = value;
+            }
+        }
+
+        /// <summary>
+        /// Sets the the upper bound for a random delay in milliseconds added to
+        /// ReconnectWait during a reconnect for clear and TLS connections.
+        /// </summary>
+        /// <remarks>
+        /// Defaults are 100 ms and 1s for TLS.
+        /// </remarks>
+        /// <seealso cref="ReconnectDelayHandler"/>
+        /// <seealso cref="ReconnectJitter"/>
+        /// <seealso cref="ReconnectJitterTLS"/>
+        /// <seealso cref="ReconnectWait"/>
+        public void SetReconnectJitter(int jitter, int tlsJitter)
+        {
+            if (jitter < 0 || tlsJitter < 0)
+            {
+                throw new ArgumentOutOfRangeException("value", "Reconnect jitter must be positive");
+            }
+
+            reconnectJitter = jitter;
+            reconnectJitterTLS = tlsJitter;
+        }
+
+        /// <summary>
+        /// Get the the upper bound for a random delay added to
+        /// ReconnectWait during a reconnect for connections.
+        /// </summary>
+        /// <seealso cref="ReconnectDelayHandler"/>
+        /// <seealso cref="ReconnectJitterTLS"/>
+        /// <seealso cref="ReconnectWait"/>
+        /// <seealso cref="SetReconnectJitter(int, int)"/>
+        public int ReconnectJitter { get => reconnectJitter; }
+
+
+        /// <summary>
+        /// Get the the upper bound for a random delay added to
+        /// ReconnectWait during a reconnect for TLS connections.
+        /// </summary>
+        /// <seealso cref="ReconnectDelayHandler"/>
+        /// <seealso cref="ReconnectJitter"/>
+        /// <seealso cref="SetReconnectJitter(int, int)"/>
+        public int ReconnectJitterTLS { get => reconnectJitterTLS; }
+
         /// <summary>
         /// Returns a string representation of the
         /// value of this Options instance.
@@ -600,6 +757,10 @@ namespace NATS.Client
             appendEventHandler(sb, "AsyncErrorEventHandler", AsyncErrorEventHandler);
             appendEventHandler(sb, "ClosedEventHandler", ClosedEventHandler);
             appendEventHandler(sb, "DisconnectedEventHandler", DisconnectedEventHandler);
+            appendEventHandler(sb, "ReconnectedEventHandler", ReconnectedEventHandler);
+            appendEventHandler(sb, "ReconnectDelayHandler", ReconnectDelayHandler);
+            appendEventHandler(sb, "ServerDiscoveredEventHandler", ServerDiscoveredEventHandler);
+            appendEventHandler(sb, "LameDuckModeEventHandler", LameDuckModeEventHandler);
 
             sb.AppendFormat("MaxPingsOut={0};", MaxPingsOut);
             sb.AppendFormat("MaxReconnect={0};", MaxReconnect);
@@ -609,12 +770,15 @@ namespace NATS.Client
             sb.AppendFormat("Pendantic={0};", Pedantic);
             sb.AppendFormat("UseOldRequestStyle={0}", UseOldRequestStyle);
             sb.AppendFormat("PingInterval={0};", PingInterval);
+            sb.AppendFormat("ReconnectBufferSize={0};", ReconnectBufferSize);
+            sb.AppendFormat("ReconnectJitter={0};", ReconnectJitter);
+            sb.AppendFormat("ReconnectJitterTLS={0};", ReconnectJitterTLS);
             sb.AppendFormat("ReconnectWait={0};", ReconnectWait);
             sb.AppendFormat("Secure={0};", Secure);
-            sb.AppendFormat("User={0};", User);
-            sb.AppendFormat("Token={0};", Token);
             sb.AppendFormat("SubscriberDeliveryTaskCount={0};", SubscriberDeliveryTaskCount);
             sb.AppendFormat("SubscriptionBatchSize={0};", SubscriptionBatchSize);
+            sb.AppendFormat("User={0};", User);
+            sb.AppendFormat("Token={0};", Token);
 
             if (Servers == null)
             {

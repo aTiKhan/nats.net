@@ -252,9 +252,5 @@ paket-files/
 .idea/
 *.sln.iml
 
-# Tools
-tools/**
-!tools/packages.config
-
-# Settings
-.env
+# Benchmark artifacts
+**/BenchmarkDotNet.Artifacts/

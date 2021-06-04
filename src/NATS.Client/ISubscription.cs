@@ -11,6 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+using System;
 using System.Threading.Tasks;
 
 namespace NATS.Client
@@ -26,7 +27,7 @@ namespace NATS.Client
     /// </remarks>
     /// <seealso cref="ISyncSubscription"/>
     /// <seealso cref="IAsyncSubscription"/>
-    public interface ISubscription
+    public interface ISubscription : IDisposable
     {
         /// <summary>
         /// Gets the subject for this subscription.
@@ -45,7 +46,7 @@ namespace NATS.Client
         /// <item>Wildcards must be separate tokens (<c>foo.*.bar</c> or <c>foo.&gt;</c> are syntactically
         /// valid; <c>foo*.bar</c>, <c>f*o.b*r</c> and <c>foo&gt;</c> are not).</item>
         /// </list>
-        /// <para>For example, the wildcard subscrpitions <c>foo.*.quux</c> and <c>foo.&gt;</c> both match
+        /// <para>For example, the wildcard subscriptions <c>foo.*.quux</c> and <c>foo.&gt;</c> both match
         /// <c>foo.bar.quux</c>, but only the latter matches <c>foo.bar.baz</c>. With the full wildcard,
         /// it is also possible to express interest in every subject that may exist in NATS (<c>&gt;</c>).</para>
         /// </remarks>
